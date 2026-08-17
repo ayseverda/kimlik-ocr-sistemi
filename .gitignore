@@ -1,0 +1,10 @@
+﻿__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+temp/
+tmp/
+*.xlsx
+*.pdf
+referans_kimlik.jpg

@@ -1,0 +1,7 @@
+opencv-python
+pytesseract
+pandas
+openpyxl
+pdf2image
+streamlit
+PyMuPDF
