@@ -3,14 +3,14 @@
 streamlit==1.61.1
 easyocr==1.7.2
 
-torch==2.7.1
-torchvision==0.22.1
+torch==2.12.1
+torchvision==0.27.1
 
-opencv-python-headless==4.11.0.86
+opencv-python-headless==5.0.0.93
 
-numpy==2.2.6
-pandas==2.3.1
+numpy==2.5.2
+pandas==3.0.5
 openpyxl==3.1.5
 
-PyMuPDF==1.26.3
-Pillow==11.3.0
+PyMuPDF==1.28.2
+Pillow==12.3.0
