@@ -1,10 +1,20 @@
-﻿__pycache__/
+﻿# Python
+__pycache__/
 *.pyc
 .venv/
 venv/
 env/
-temp/
-tmp/
-*.xlsx
+
+# Streamlit
+.streamlit/secrets.toml
+
+# İşletim sistemi
+.DS_Store
+Thumbs.db
+
+# Gerçek kimlik görselleri / test verisi burada tutulmasın
+*.jpg
+*.jpeg
+*.png
 *.pdf
-referans_kimlik.jpg
+!referans_kimlik.jpg
