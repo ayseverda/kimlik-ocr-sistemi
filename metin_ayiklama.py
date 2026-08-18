@@ -1,446 +1,59 @@
 import cv2
 import re
-import logging
+import time
+import easyocr
 import numpy as np
-from paddleocr import PaddleOCR
-
-
-logging.disable(logging.WARNING)
+from difflib import SequenceMatcher
 
 
 # =========================================================
-# PADDLE OCR
+# EASYOCR
 # =========================================================
 
-ocr = PaddleOCR(
-    lang="tr",
-    use_doc_orientation_classify=False,
-    use_doc_unwarping=False,
-    use_textline_orientation=False
+reader = easyocr.Reader(
+    ["tr", "en"],
+    gpu=False
+)
+
+# İsim ikinci okumada OCR'ı sadece harflere yönlendiriyoruz.
+ISIM_ALLOWLIST = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "ÇĞİÖŞÜ"
+    " "
 )
 
 
 # =========================================================
-# METİN NORMALİZASYONU
+# METİN YARDIMCILARI
 # =========================================================
 
 def normalize_text(text):
     text = str(text).upper().strip()
 
-    tablo = str.maketrans({
-        "İ": "I",
-        "Ş": "S",
-        "Ğ": "G",
-        "Ü": "U",
-        "Ö": "O",
-        "Ç": "C"
-    })
-
-    text = text.translate(tablo)
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
+    text = text.translate(
+        str.maketrans({
+            "İ": "I",
+            "Ş": "S",
+            "Ğ": "G",
+            "Ü": "U",
+            "Ö": "O",
+            "Ç": "C"
+        })
     )
+
+    text = re.sub(r"[^A-Z0-9 ]", " ", text)
+    text = re.sub(r"\s+", " ", text)
 
     return text.strip()
 
 
-# =========================================================
-# TC DOĞRULAMA
-# =========================================================
+def benzerlik(a, b):
+    return SequenceMatcher(
+        None,
+        normalize_text(a),
+        normalize_text(b)
+    ).ratio()
 
-def tc_kimlik_gecerli_mi(no):
-    if not no:
-        return False
-
-    if len(no) != 11:
-        return False
-
-    if not no.isdigit():
-        return False
-
-    if no[0] == "0":
-        return False
-
-    d = [int(x) for x in no]
-
-    d10 = (
-        (
-            sum(d[0:9:2]) * 7
-        )
-        -
-        sum(d[1:8:2])
-    ) % 10
-
-    d11 = sum(d[:10]) % 10
-
-    return (
-        d[9] == d10
-        and
-        d[10] == d11
-    )
-
-
-# =========================================================
-# TC OCR HATALARINI DÜZELT
-# =========================================================
-
-def tc_metni_duzelt(text):
-    text = str(text).upper()
-
-    donusum = {
-        "O": "0",
-        "Q": "0",
-        "D": "0",
-
-        "I": "1",
-        "İ": "1",
-        "L": "1",
-
-        "Z": "2",
-        "S": "5",
-        "G": "6",
-        "B": "8"
-    }
-
-    sonuc = ""
-
-    for karakter in text:
-
-        if karakter.isdigit():
-            sonuc += karakter
-
-        elif karakter in donusum:
-            sonuc += donusum[karakter]
-
-    return sonuc
-
-
-# =========================================================
-# PADDLE SONUCUNU OKU
-# =========================================================
-
-def paddle_oku(resim):
-    """
-    PaddleOCR 3.x sonucunu standart hale getirir.
-    """
-
-    bulunanlar = []
-
-    try:
-        sonuclar = ocr.predict(resim)
-
-    except Exception as e:
-        print(
-            "PaddleOCR predict hatası:",
-            repr(e)
-        )
-        return []
-
-    for sonuc in sonuclar:
-
-        try:
-            data = sonuc.json
-
-        except Exception as e:
-            print(
-                "OCR JSON alınamadı:",
-                repr(e)
-            )
-            continue
-
-        if (
-            isinstance(data, dict)
-            and
-            "res" in data
-        ):
-            data = data["res"]
-
-        if not isinstance(data, dict):
-            continue
-
-        metinler = data.get(
-            "rec_texts",
-            []
-        )
-
-        guvenler = data.get(
-            "rec_scores",
-            []
-        )
-
-        kutular = data.get(
-            "rec_polys",
-            []
-        )
-
-        for i, text in enumerate(
-            metinler
-        ):
-
-            text = str(text).strip()
-
-            if not text:
-                continue
-
-            try:
-                conf = float(
-                    guvenler[i]
-                )
-            except Exception:
-                conf = 0.0
-
-            try:
-                box = np.asarray(
-                    kutular[i],
-                    dtype=np.float32
-                )
-
-                xs = box[:, 0]
-                ys = box[:, 1]
-
-                x1 = int(xs.min())
-                y1 = int(ys.min())
-                x2 = int(xs.max())
-                y2 = int(ys.max())
-
-            except Exception:
-
-                x1 = 0
-                y1 = 0
-                x2 = 0
-                y2 = 0
-
-            bulunanlar.append({
-                "text": text,
-                "norm": normalize_text(text),
-                "conf": conf,
-
-                "x1": x1,
-                "y1": y1,
-                "x2": x2,
-                "y2": y2,
-
-                "cx": (x1 + x2) // 2,
-                "cy": (y1 + y2) // 2,
-
-                "w": max(0, x2 - x1),
-                "h": max(0, y2 - y1)
-            })
-
-    return bulunanlar
-
-
-# =========================================================
-# LABEL KONTROLLERİ
-# =========================================================
-
-def soyad_label_mi(item):
-    t = item["norm"]
-
-    return (
-        "SOYADI" in t
-        or
-        "SURNAME" in t
-    )
-
-
-def ad_label_mi(item):
-    t = item["norm"]
-
-    # Soyadı içindeki ADI yüzünden yanlış eşleşmesin
-    if (
-        "SOYADI" in t
-        or
-        "SURNAME" in t
-    ):
-        return False
-
-    return (
-        "ADI" in t
-        and
-        "GIVEN" in t
-    )
-
-
-# =========================================================
-# LABEL BUL
-# =========================================================
-
-def label_bul(
-    ocr_sonuclari,
-    kontrol_fonksiyonu
-):
-
-    adaylar = [
-        item
-        for item in ocr_sonuclari
-        if kontrol_fonksiyonu(item)
-    ]
-
-    if not adaylar:
-        return None
-
-    adaylar.sort(
-        key=lambda x: x["conf"],
-        reverse=True
-    )
-
-    return adaylar[0]
-
-
-# =========================================================
-# İSİM ADAYI MI?
-# =========================================================
-
-def isim_adayi_mi(item):
-    text = item["text"]
-
-    norm = item["norm"]
-
-    # Başka label alanlarını value sanmasın
-    label_kelimeleri = [
-        "SOYADI",
-        "SURNAME",
-        "ADI",
-        "GIVEN",
-        "DOGUM",
-        "DATE OF BIRTH",
-        "CINSIYET",
-        "GENDER",
-        "SERI",
-        "DOCUMENT",
-        "UYRUGU",
-        "NATIONALITY",
-        "GECERLILIK",
-        "VALID",
-        "IMZASI",
-        "SIGNATURE",
-        "KIMLIK",
-        "IDENTITY"
-    ]
-
-    if any(
-        kelime in norm
-        for kelime in label_kelimeleri
-    ):
-        return False
-
-    # Harf içermeli
-    if not re.search(
-        r"[A-Za-zÇĞİÖŞÜçğıöşü]",
-        text
-    ):
-        return False
-
-    # Fazla rakam içeriyorsa isim değildir
-    rakam_sayisi = sum(
-        c.isdigit()
-        for c in text
-    )
-
-    if rakam_sayisi > 1:
-        return False
-
-    return True
-
-
-# =========================================================
-# LABEL ALTINDAKİ EN UYGUN DEĞER
-# =========================================================
-
-def label_altindaki_degeri_bul(
-    ocr_sonuclari,
-    label,
-    maksimum_dikey=100
-):
-    """
-    Sabit koordinat kullanmaz.
-    Label'ın hemen altında, aynı sütunda bulunan value'yu seçer.
-    """
-
-    if label is None:
-        return ""
-
-    adaylar = []
-
-    for item in ocr_sonuclari:
-
-        if item is label:
-            continue
-
-        if not isim_adayi_mi(
-            item
-        ):
-            continue
-
-        # ---------------------------------------------
-        # Label'ın altında mı?
-        # ---------------------------------------------
-
-        dikey_fark = (
-            item["y1"]
-            -
-            label["y2"]
-        )
-
-        if dikey_fark < -10:
-            continue
-
-        if dikey_fark > maksimum_dikey:
-            continue
-
-        # ---------------------------------------------
-        # Aynı sütunda mı?
-        # ---------------------------------------------
-
-        yatay_fark = abs(
-            item["x1"]
-            -
-            label["x1"]
-        )
-
-        if yatay_fark > 180:
-            continue
-
-        # ---------------------------------------------
-        # SKOR
-        # ---------------------------------------------
-
-        skor = 0
-
-        # Yakın olan daha iyi
-        skor -= dikey_fark * 4
-
-        # X hizası
-        skor -= yatay_fark * 0.5
-
-        # OCR güveni
-        skor += item["conf"] * 100
-
-        adaylar.append(
-            (
-                skor,
-                item
-            )
-        )
-
-    if not adaylar:
-        return ""
-
-    adaylar.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    return adaylar[0][1]["text"]
-
-
-# =========================================================
-# İSİM TEMİZLE
-# =========================================================
 
 def isim_temizle(text):
     if not text:
@@ -458,23 +71,72 @@ def isim_temizle(text):
         r"\s+",
         " ",
         text
-    ).strip()
+    )
 
-    return text
+    return text.strip()
 
 
 # =========================================================
-# TC BUL
+# TC
 # =========================================================
 
-def tc_bul(
-    ocr_sonuclari
-):
+def tc_kimlik_gecerli_mi(no):
+    if (
+        not no
+        or len(no) != 11
+        or not no.isdigit()
+        or no[0] == "0"
+    ):
+        return False
 
-    # -----------------------------------------------------
-    # 1. Direkt 11 rakam
-    # -----------------------------------------------------
+    d = [int(x) for x in no]
 
+    d10 = (
+        sum(d[0:9:2]) * 7
+        -
+        sum(d[1:8:2])
+    ) % 10
+
+    d11 = sum(d[:10]) % 10
+
+    return (
+        d[9] == d10
+        and
+        d[10] == d11
+    )
+
+
+def tc_metni_duzelt(text):
+    donusum = {
+        "O": "0",
+        "Q": "0",
+        "D": "0",
+
+        "I": "1",
+        "İ": "1",
+        "L": "1",
+
+        "Z": "2",
+        "S": "5",
+        "G": "6",
+        "B": "8"
+    }
+
+    sonuc = ""
+
+    for karakter in str(text).upper():
+
+        if karakter.isdigit():
+            sonuc += karakter
+
+        elif karakter in donusum:
+            sonuc += donusum[karakter]
+
+    return sonuc
+
+
+def tc_bul(ocr_sonuclari):
+    # Önce normal
     for item in ocr_sonuclari:
 
         rakamlar = re.sub(
@@ -483,171 +145,828 @@ def tc_bul(
             item["text"]
         )
 
-        if len(rakamlar) == 11:
+        if (
+            len(rakamlar) == 11
+            and tc_kimlik_gecerli_mi(rakamlar)
+        ):
+            return rakamlar, item
 
-            if tc_kimlik_gecerli_mi(
-                rakamlar
-            ):
-                return rakamlar
-
-    # -----------------------------------------------------
-    # 2. OCR harf-rakam hataları
-    # -----------------------------------------------------
-
+    # OCR hata düzeltmeli
     for item in ocr_sonuclari:
 
         aday = tc_metni_duzelt(
             item["text"]
         )
 
-        if len(aday) == 11:
+        if (
+            len(aday) == 11
+            and tc_kimlik_gecerli_mi(aday)
+        ):
+            return aday, item
 
-            if tc_kimlik_gecerli_mi(
-                aday
-            ):
-                return aday
-
-    return "Bulunamadi"
+    return "Bulunamadi", None
 
 
 # =========================================================
-# PADDLE DEBUG
+# EASYOCR - ANA OKUMA
 # =========================================================
 
-def paddle_debug_resmi(
+def easyocr_oku(
+    resim,
+    offset_x=0,
+    offset_y=0
+):
+    baslangic = time.perf_counter()
+
+    bulunanlar = []
+
+    try:
+        sonuclar = reader.readtext(
+            resim,
+            detail=1,
+            paragraph=False,
+            decoder="greedy"
+        )
+
+    except Exception as e:
+        print("EasyOCR hatası:", repr(e))
+        return [], 0.0
+
+
+    for sonuc in sonuclar:
+
+        try:
+            box, text, conf = sonuc
+        except Exception:
+            continue
+
+        text = str(text).strip()
+
+        if not text:
+            continue
+
+        box = np.asarray(
+            box,
+            dtype=np.float32
+        )
+
+        x1 = int(box[:, 0].min()) + offset_x
+        y1 = int(box[:, 1].min()) + offset_y
+        x2 = int(box[:, 0].max()) + offset_x
+        y2 = int(box[:, 1].max()) + offset_y
+
+        bulunanlar.append({
+            "text": text,
+            "norm": normalize_text(text),
+            "conf": float(conf),
+
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2
+        })
+
+
+    sure = (
+        time.perf_counter()
+        -
+        baslangic
+    )
+
+    return bulunanlar, sure
+
+
+# =========================================================
+# LABEL BUL
+# =========================================================
+
+def fuzzy_label_bul(
+    ocr_sonuclari,
+    hedefler,
+    esik=0.40
+):
+    """
+    Eskiden 0.48 idi.
+
+    Biraz bulanık kartlarda:
+        Soyadi / Surname
+        Adi / Given Name
+
+    kötü okunabildiği için 0.40'a indirdik.
+    """
+
+    en_iyi_item = None
+    en_iyi_skor = 0.0
+
+    for item in ocr_sonuclari:
+
+        for hedef in hedefler:
+
+            skor = benzerlik(
+                item["text"],
+                hedef
+            )
+
+            if skor > en_iyi_skor:
+                en_iyi_skor = skor
+                en_iyi_item = item
+
+
+    if en_iyi_skor < esik:
+        return None
+
+    return en_iyi_item
+
+
+# =========================================================
+# SABİT KİMLİK LABEL'I MI?
+# =========================================================
+
+def label_metni_mi(text):
+    norm = normalize_text(text)
+
+    yasaklar = [
+        "TURKIYE",
+        "REPUBLIC",
+        "IDENTITY",
+        "KIMLIK",
+        "CARD",
+
+        "SOYADI",
+        "SURNAME",
+
+        "ADI",
+        "GIVEN",
+
+        "DATE",
+        "BIRTH",
+
+        "GENDER",
+        "CINSIYET",
+
+        "DOCUMENT",
+        "SERI",
+
+        "NATIONALITY",
+        "UYRUGU",
+
+        "VALID",
+        "GECERLILIK",
+
+        "SIGNATURE",
+        "IMZASI"
+    ]
+
+    return any(
+        kelime in norm
+        for kelime in yasaklar
+    )
+
+
+# =========================================================
+# LABEL'DAN SONRA DEĞER BUL
+# =========================================================
+
+def label_degerini_bul(
+    ocr_sonuclari,
+    label,
+    maksimum_sonraki=5,
+    maksimum_dikey=145
+):
+    """
+    Artık confidence 0.70 şartı YOK.
+
+    Label bulunduysa:
+    - konum
+    - OCR sırası
+    - yatay hizalama
+    - confidence
+
+    birlikte değerlendirilir.
+
+    Böylece MEHMET = 0.671 gibi doğru sonuçlar
+    çöpe gitmez.
+
+    %G0z = 0.127 gibi çok kötü okunmuş ama
+    doğru konumdaki UĞUZ kutusu da aday olabilir.
+    """
+
+    if label is None:
+        return None
+
+
+    try:
+        label_index = ocr_sonuclari.index(
+            label
+        )
+
+    except ValueError:
+        return None
+
+
+    adaylar = []
+
+    bitis = min(
+        label_index + 1 + maksimum_sonraki,
+        len(ocr_sonuclari)
+    )
+
+
+    for i in range(
+        label_index + 1,
+        bitis
+    ):
+
+        item = ocr_sonuclari[i]
+
+        text = item["text"].strip()
+
+        if not text:
+            continue
+
+
+        # Tamamen sayıysa isim olamaz
+        sadece_rakam = re.sub(
+            r"\D",
+            "",
+            text
+        )
+
+        if (
+            sadece_rakam
+            and len(sadece_rakam) == len(text)
+        ):
+            continue
+
+
+        # Güçlü biçimde başka bir label ise alma
+        if label_metni_mi(text):
+            continue
+
+
+        # Label'ın altında olmalı
+        dikey_fark = (
+            item["y1"]
+            -
+            label["y2"]
+        )
+
+        if (
+            dikey_fark < -10
+            or
+            dikey_fark > maksimum_dikey
+        ):
+            continue
+
+
+        # Çok uzak başka sütun olmasın
+        yatay_fark = abs(
+            item["x1"]
+            -
+            label["x1"]
+        )
+
+        if yatay_fark > 230:
+            continue
+
+
+        index_farki = (
+            i - label_index
+        )
+
+
+        # =============================================
+        # SKOR
+        # =============================================
+        #
+        # Konuma confidence'tan daha fazla önem veriyoruz.
+        #
+        # Label'ın hemen altındaki düşük confidence'lı
+        # kutu bile seçilebilir.
+        # =============================================
+
+        skor = 0
+
+        skor += item["conf"] * 35
+
+        skor -= max(
+            0,
+            dikey_fark
+        ) * 1.5
+
+        skor -= yatay_fark * 0.10
+
+        skor -= (
+            index_farki - 1
+        ) * 6
+
+
+        # Hemen altındaki kutuya bonus
+        if (
+            0 <= dikey_fark <= 55
+        ):
+            skor += 30
+
+
+        # Aynı sol hizaya yakınsa bonus
+        if yatay_fark <= 70:
+            skor += 15
+
+
+        adaylar.append(
+            (
+                skor,
+                item
+            )
+        )
+
+
+    if not adaylar:
+        return None
+
+
+    return max(
+        adaylar,
+        key=lambda x: x[0]
+    )[1]
+
+
+# =========================================================
+# KÜÇÜK İSİM KUTUSUNU TEKRAR OKU
+# =========================================================
+
+def isim_kutusunu_tekrar_oku(
     kart,
-    ocr_sonuclari
+    item
+):
+    """
+    İlk EasyOCR sonucu düşük confidence ise
+    SADECE seçilmiş küçük ad/soyad kutusunu tekrar okur.
+
+    Örneğin:
+
+        %G0z   -> UĞUZ
+
+    Bütün kart ikinci kez OCR'a girmez.
+    """
+
+    if item is None:
+        return None
+
+
+    h, w = kart.shape[:2]
+
+    pad_x = 14
+    pad_y = 10
+
+
+    x1 = max(
+        0,
+        item["x1"] - pad_x
+    )
+
+    y1 = max(
+        0,
+        item["y1"] - pad_y
+    )
+
+    x2 = min(
+        w,
+        item["x2"] + pad_x
+    )
+
+    y2 = min(
+        h,
+        item["y2"] + pad_y
+    )
+
+
+    roi = kart[
+        y1:y2,
+        x1:x2
+    ]
+
+
+    if roi.size == 0:
+        return None
+
+
+    # =====================================================
+    # BÜYÜT
+    # =====================================================
+
+    roi = cv2.resize(
+        roi,
+        None,
+        fx=3.0,
+        fy=3.0,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+
+    # =====================================================
+    # HAFİF KONTRAST
+    # =====================================================
+
+    gri = cv2.cvtColor(
+        roi,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    clahe = cv2.createCLAHE(
+        clipLimit=1.8,
+        tileGridSize=(8, 8)
+    )
+
+    gri = clahe.apply(
+        gri
+    )
+
+
+    # =====================================================
+    # İKİNCİ EASYOCR
+    # =====================================================
+
+    try:
+
+        sonuclar = reader.readtext(
+            gri,
+
+            detail=1,
+            paragraph=False,
+
+            decoder="greedy",
+
+            allowlist=ISIM_ALLOWLIST,
+
+            text_threshold=0.25,
+            low_text=0.20,
+            link_threshold=0.20,
+
+            contrast_ths=0.05,
+            adjust_contrast=0.7,
+
+            mag_ratio=1.5
+        )
+
+    except Exception:
+        return None
+
+
+    if not sonuclar:
+        return None
+
+
+    adaylar = []
+
+
+    for _, text, conf in sonuclar:
+
+        temiz = isim_temizle(
+            text
+        )
+
+        if not temiz:
+            continue
+
+
+        harf_sayisi = len(
+            re.sub(
+                r"[^A-ZÇĞİÖŞÜ]",
+                "",
+                temiz
+            )
+        )
+
+
+        if harf_sayisi < 2:
+            continue
+
+
+        adaylar.append(
+            (
+                float(conf),
+                temiz
+            )
+        )
+
+
+    if not adaylar:
+        return None
+
+
+    return max(
+        adaylar,
+        key=lambda x: x[0]
+    )
+
+
+# =========================================================
+# SEÇİLEN DEĞERİ İYİLEŞTİR
+# =========================================================
+
+def secilen_isimi_iyilestir(
+    kart,
+    item
+):
+    if item is None:
+        return None
+
+
+    ilk_text = isim_temizle(
+        item["text"]
+    )
+
+    ilk_conf = item["conf"]
+
+
+    # =============================================
+    # ZATEN ÇOK İYİYSE HİÇBİR ŞEY YAPMA
+    # =============================================
+
+    temiz_mi = bool(
+        re.fullmatch(
+            r"[A-ZÇĞİÖŞÜ\s\-]+",
+            ilk_text
+        )
+    )
+
+
+    if (
+        ilk_conf >= 0.72
+        and
+        temiz_mi
+    ):
+        return ilk_text
+
+
+    # =============================================
+    # DÜŞÜK GÜVEN -> KÜÇÜK ROI SECOND PASS
+    # =============================================
+
+    ikinci = isim_kutusunu_tekrar_oku(
+        kart,
+        item
+    )
+
+
+    if ikinci is None:
+
+        # İlk sonuç tamamen çöp değilse
+        # son çare olarak onu kullan.
+        if (
+            ilk_conf >= 0.45
+            and
+            temiz_mi
+        ):
+            return ilk_text
+
+        return None
+
+
+    ikinci_conf, ikinci_text = (
+        ikinci
+    )
+
+
+    # Yeni OCR çok kötüyse kullanma
+    if ikinci_conf < 0.25:
+
+        if (
+            ilk_conf >= 0.45
+            and
+            temiz_mi
+        ):
+            return ilk_text
+
+        return None
+
+
+    return ikinci_text
+
+
+# =========================================================
+# FALLBACK
+# =========================================================
+
+def fallback_isim_adayi_mi(item):
+
+    text = item["text"].strip()
+
+    if not text:
+        return False
+
+
+    if item["conf"] < 0.45:
+        return False
+
+
+    # Tamamen sayı içeren alanları at
+    if re.fullmatch(
+        r"[\d\W]+",
+        text
+    ):
+        return False
+
+
+    if label_metni_mi(text):
+        return False
+
+
+    temiz = isim_temizle(
+        text
+    )
+
+
+    harf_sayisi = len(
+        re.sub(
+            r"[^A-ZÇĞİÖŞÜ]",
+            "",
+            temiz
+        )
+    )
+
+
+    return harf_sayisi >= 3
+
+
+def relative_fallback(
+    ocr_sonuclari,
+    tc_item=None
+):
+
+    tc_index = None
+
+
+    if tc_item is not None:
+
+        try:
+
+            tc_index = ocr_sonuclari.index(
+                tc_item
+            )
+
+        except ValueError:
+
+            tc_index = None
+
+
+    if tc_index is None:
+
+        for i, item in enumerate(
+            ocr_sonuclari
+        ):
+
+            rakamlar = re.sub(
+                r"\D",
+                "",
+                item["text"]
+            )
+
+            if (
+                len(rakamlar) == 11
+                and
+                tc_kimlik_gecerli_mi(
+                    rakamlar
+                )
+            ):
+
+                tc_index = i
+                break
+
+
+    if tc_index is None:
+        return None, None
+
+
+    adaylar = []
+
+
+    for item in ocr_sonuclari[
+        tc_index + 1:
+        tc_index + 10
+    ]:
+
+        if fallback_isim_adayi_mi(
+            item
+        ):
+
+            adaylar.append(
+                item
+            )
+
+
+    if len(adaylar) < 2:
+        return None, None
+
+
+    # TC sonrası genel sıra:
+    # SOYAD -> AD
+
+    return (
+        adaylar[1],
+        adaylar[0]
+    )
+
+
+# =========================================================
+# AYNI KUTU KONTROLÜ
+# =========================================================
+
+def ayni_item_mi(a, b):
+
+    if a is None or b is None:
+        return False
+
+    return (
+        a["x1"] == b["x1"]
+        and
+        a["y1"] == b["y1"]
+        and
+        a["x2"] == b["x2"]
+        and
+        a["y2"] == b["y2"]
+    )
+
+
+# =========================================================
+# DEBUG
+# =========================================================
+
+def debug_resmi_olustur(
+    kart,
+    tc_item,
+    soyad_item,
+    ad_item
 ):
 
     debug = kart.copy()
 
-    for index, item in enumerate(
-        ocr_sonuclari
-    ):
 
-        # OCR kutusu
+    alanlar = [
+        (
+            "TC",
+            tc_item,
+            (0, 255, 0)
+        ),
+
+        (
+            "SOYAD",
+            soyad_item,
+            (0, 255, 255)
+        ),
+
+        (
+            "AD",
+            ad_item,
+            (255, 255, 0)
+        )
+    ]
+
+
+    for isim, item, renk in alanlar:
+
+        if item is None:
+            continue
+
+
         cv2.rectangle(
             debug,
+
             (
                 item["x1"],
                 item["y1"]
             ),
+
             (
                 item["x2"],
                 item["y2"]
             ),
-            (0, 255, 0),
-            2
+
+            renk,
+            4
         )
 
-        # sıra numarası
+
         cv2.putText(
             debug,
-            str(index + 1),
+            isim,
+
             (
                 item["x1"],
                 max(
-                    20,
-                    item["y1"] - 5
+                    25,
+                    item["y1"] - 10
                 )
             ),
+
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 0, 255),
+            0.7,
+            renk,
             2,
             cv2.LINE_AA
         )
 
-    return debug
-
-
-# =========================================================
-# LABEL DEBUG
-# =========================================================
-
-def label_debug_resmi(
-    kart,
-    ocr_sonuclari,
-    soyad_label,
-    ad_label
-):
-
-    debug = paddle_debug_resmi(
-        kart,
-        ocr_sonuclari
-    )
-
-    # -----------------------------------------------------
-    # SOYAD LABEL
-    # -----------------------------------------------------
-
-    if soyad_label:
-
-        cv2.rectangle(
-            debug,
-            (
-                soyad_label["x1"],
-                soyad_label["y1"]
-            ),
-            (
-                soyad_label["x2"],
-                soyad_label["y2"]
-            ),
-            (0, 255, 255),
-            4
-        )
-
-        cv2.putText(
-            debug,
-            "SOYAD",
-            (
-                soyad_label["x1"],
-                max(
-                    25,
-                    soyad_label["y1"] - 20
-                )
-            ),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 255),
-            2
-        )
-
-    # -----------------------------------------------------
-    # AD LABEL
-    # -----------------------------------------------------
-
-    if ad_label:
-
-        cv2.rectangle(
-            debug,
-            (
-                ad_label["x1"],
-                ad_label["y1"]
-            ),
-            (
-                ad_label["x2"],
-                ad_label["y2"]
-            ),
-            (255, 255, 0),
-            4
-        )
-
-        cv2.putText(
-            debug,
-            "AD",
-            (
-                ad_label["x1"],
-                max(
-                    25,
-                    ad_label["y1"] - 20
-                )
-            ),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 0),
-            2
-        )
 
     return debug
 
@@ -657,7 +976,8 @@ def label_debug_resmi(
 # =========================================================
 
 def bilgileri_cimbizla(
-    orijinal_kart
+    orijinal_kart,
+    debug=False
 ):
 
     if orijinal_kart is None:
@@ -667,162 +987,264 @@ def bilgileri_cimbizla(
             "ad": "Bulunamadi",
             "soyad": "Bulunamadi",
             "guven": "dusuk",
-            "paddle_debug": None,
+
+            "ocr_suresi": 0.0,
+
             "debug_resmi": None,
             "tum_ocr": []
         }
 
-    # =====================================================
-    # OCR
-    # =====================================================
-
-    ocr_sonuclari = paddle_oku(
-        orijinal_kart
-    )
 
     # =====================================================
-    # LABEL'LAR
+    # 1. ORTAK OCR ROI
     # =====================================================
 
-    soyad_label = label_bul(
+    h, w = orijinal_kart.shape[:2]
+
+
+    x1 = int(w * 0.02)
+    x2 = int(w * 0.70)
+
+    y1 = int(h * 0.15)
+    y2 = int(h * 0.62)
+
+
+    bilgi_bolgesi = orijinal_kart[
+        y1:y2,
+        x1:x2
+    ]
+
+
+    # =====================================================
+    # 2. ANA EASYOCR
+    # =====================================================
+
+    (
         ocr_sonuclari,
-        soyad_label_mi
+        ocr_suresi
+    ) = easyocr_oku(
+        bilgi_bolgesi,
+        offset_x=x1,
+        offset_y=y1
     )
 
-    ad_label = label_bul(
-        ocr_sonuclari,
-        ad_label_mi
-    )
 
     # =====================================================
-    # SOYAD
+    # 3. TC
     # =====================================================
 
-    soyad = label_altindaki_degeri_bul(
-        ocr_sonuclari,
-        soyad_label,
-        maksimum_dikey=80
-    )
-
-    soyad = isim_temizle(
-        soyad
-    )
-
-    # =====================================================
-    # AD
-    # =====================================================
-
-    ad = label_altindaki_degeri_bul(
-        ocr_sonuclari,
-        ad_label,
-        maksimum_dikey=90
-    )
-
-    ad = isim_temizle(
-        ad
-    )
-
-    # =====================================================
-    # TC
-    # =====================================================
-
-    tc_no = tc_bul(
+    tc_no, tc_item = tc_bul(
         ocr_sonuclari
     )
 
-    # =====================================================
-    # BOŞLAR
-    # =====================================================
-
-    if not soyad:
-        soyad = "Bulunamadi"
-
-    if not ad:
-        ad = "Bulunamadi"
 
     # =====================================================
-    # GÜVEN
+    # 4. LABEL'LAR
     # =====================================================
 
-    bulunan = 0
+    soyad_label = fuzzy_label_bul(
+        ocr_sonuclari,
+        [
+            "SOYADI SURNAME",
+            "SURNAME",
+            "SOYADI"
+        ]
+    )
 
-    if tc_no != "Bulunamadi":
-        bulunan += 1
 
-    if ad != "Bulunamadi":
-        bulunan += 1
+    ad_label = fuzzy_label_bul(
+        ocr_sonuclari,
+        [
+            "ADI GIVEN NAME S",
+            "ADI GIVEN NAMES",
+            "ADI GIVEN NAME",
 
-    if soyad != "Bulunamadi":
-        bulunan += 1
+            "GIVEN NAME S",
+            "GIVEN NAMES",
+            "GIVEN NAME"
+        ]
+    )
+
+
+    # =====================================================
+    # 5. LABEL TABANLI DEĞERLER
+    # =====================================================
+
+    soyad_item = label_degerini_bul(
+        ocr_sonuclari,
+        soyad_label,
+        maksimum_sonraki=5,
+        maksimum_dikey=145
+    )
+
+
+    ad_item = label_degerini_bul(
+        ocr_sonuclari,
+        ad_label,
+        maksimum_sonraki=5,
+        maksimum_dikey=145
+    )
+
+
+    # =====================================================
+    # 6. FALLBACK
+    # =====================================================
+
+    if (
+        soyad_item is None
+        or
+        ad_item is None
+        or
+        ayni_item_mi(
+            ad_item,
+            soyad_item
+        )
+    ):
+
+        (
+            fallback_ad,
+            fallback_soyad
+        ) = relative_fallback(
+            ocr_sonuclari,
+            tc_item
+        )
+
+
+        if soyad_item is None:
+            soyad_item = fallback_soyad
+
+
+        if ad_item is None:
+            ad_item = fallback_ad
+
+
+        if ayni_item_mi(
+            ad_item,
+            soyad_item
+        ):
+
+            ad_item = fallback_ad
+            soyad_item = fallback_soyad
+
+
+    # =====================================================
+    # 7. LOW CONF SECOND PASS
+    # =====================================================
+
+    soyad = secilen_isimi_iyilestir(
+        orijinal_kart,
+        soyad_item
+    )
+
+
+    ad = secilen_isimi_iyilestir(
+        orijinal_kart,
+        ad_item
+    )
+
+
+    ad = (
+        ad
+        if ad
+        else "Bulunamadi"
+    )
+
+
+    soyad = (
+        soyad
+        if soyad
+        else "Bulunamadi"
+    )
+
+
+    # =====================================================
+    # 8. GÜVEN
+    # =====================================================
+
+    bulunan = sum([
+        tc_no != "Bulunamadi",
+        ad != "Bulunamadi",
+        soyad != "Bulunamadi"
+    ])
+
 
     if bulunan == 3:
         guven = "yuksek"
 
-    elif bulunan >= 1:
+    elif bulunan > 0:
         guven = "orta"
 
     else:
         guven = "dusuk"
 
-    # =====================================================
-    # DEBUG
-    # =====================================================
-
-    paddle_debug = paddle_debug_resmi(
-        orijinal_kart,
-        ocr_sonuclari
-    )
-
-    debug_resmi = label_debug_resmi(
-        orijinal_kart,
-        ocr_sonuclari,
-        soyad_label,
-        ad_label
-    )
 
     # =====================================================
-    # HAM OCR LİSTESİ
+    # 9. DEBUG
     # =====================================================
 
+    debug_resmi = None
     tum_ocr = []
 
-    for index, item in enumerate(
-        ocr_sonuclari
-    ):
 
-        tum_ocr.append({
-            "no": index + 1,
+    if debug:
 
-            "metin": item["text"],
+        debug_resmi = debug_resmi_olustur(
+            orijinal_kart,
+            tc_item,
+            soyad_item,
+            ad_item
+        )
 
-            "guven": round(
-                item["conf"],
-                3
-            ),
 
-            "x": item["x1"],
-            "y": item["y1"],
+        tum_ocr = [
+            {
+                "no": index + 1,
 
-            "x2": item["x2"],
-            "y2": item["y2"]
-        })
+                "text": item["text"],
 
-    # =====================================================
-    # RETURN
-    # =====================================================
+                "conf": round(
+                    item["conf"],
+                    3
+                ),
+
+                "x1": item["x1"],
+                "y1": item["y1"],
+
+                "x2": item["x2"],
+                "y2": item["y2"]
+            }
+
+            for index, item
+            in enumerate(
+                ocr_sonuclari
+            )
+        ]
+
 
     return {
-        "tc_no": tc_no,
+    "tc_no": tc_no,
+    "ad": ad,
+    "soyad": soyad,
+    "guven": guven,
 
-        "ad": ad,
+    # Ad için EasyOCR güven değeri
+    "ad_conf": (
+        float(ad_item["conf"])
+        if ad_item is not None
+        else 0.0
+    ),
 
-        "soyad": soyad,
+    # Soyad için EasyOCR güven değeri
+    "soyad_conf": (
+        float(soyad_item["conf"])
+        if soyad_item is not None
+        else 0.0
+    ),
 
-        "guven": guven,
+    # OCR işlem süresi
+    "ocr_suresi": ocr_suresi,
 
-        "paddle_debug": paddle_debug,
-
-        "debug_resmi": debug_resmi,
-
-        "tum_ocr": tum_ocr
-    }
+    # Debug bilgileri
+    "debug_resmi": debug_resmi,
+    "tum_ocr": tum_ocr
+}
