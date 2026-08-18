@@ -1,21 +1,17 @@
-# Kimlik Okuyucu — bağımlılıklar
-#
-# NOT: EasyOCR, bağımlılık olarak PyTorch'u çeker. PyTorch'un varsayılan
-# paketi CUDA (GPU) destekli gelir ve çok büyüktür (~1-2 GB); bu da özellikle
-# Streamlit Community Cloud gibi bellek/disk kısıtlı ortamlarda deploy'u
-# yavaşlatır/başarısız kılabilir. Bu proje GPU kullanmadığı için
-# (easyocr.Reader(..., gpu=False)) aşağıdaki satır PyTorch'un çok daha küçük
-# CPU-only sürümünü kurdurur. Eğer deploy ettiğiniz platform bu satırla
-# sorun çıkarırsa (bazı platformlar --extra-index-url'i desteklemeyebilir),
-# alttaki satırı silip torch'un normal sürümüyle devam edebilirsiniz.
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-streamlit>=1.32
-opencv-python-headless>=4.9
-easyocr>=1.7
-pymupdf>=1.24
-pandas>=2.0
-openpyxl>=3.1
-numpy>=1.24
-torch>=2.0
-torchvision>=0.15
+streamlit==1.61.1
+
+easyocr==1.7.2
+
+torch==2.7.1
+torchvision==0.22.1
+
+opencv-python-headless==4.11.0.86
+
+numpy==2.2.6
+pandas==2.3.1
+openpyxl==3.1.5
+
+pymupdf==1.26.3
+Pillow==11.3.0
