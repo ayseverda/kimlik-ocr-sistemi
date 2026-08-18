@@ -5,13 +5,19 @@ import os
 import tempfile
 import pymupdf
 import pandas as pd
+import time
+import re
+
+from io import BytesIO
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment
 
 from goruntu_isleme import kart_tespit_et_ve_duzelt
 from metin_ayiklama import bilgileri_cimbizla
 
 
 # =========================================================
-# SAYFA AYARLARI
+# SAYFA
 # =========================================================
 
 st.set_page_config(
@@ -23,12 +29,29 @@ st.set_page_config(
 st.title("🪪 Kimlik Kartı Okuyucu")
 
 st.caption(
-    "Kart tespiti: SIFT / Homography  •  Metin okuma: PaddleOCR"
+    "Kimlik kartlarından T.C. Kimlik No, Ad ve Soyad bilgilerini çıkarır."
 )
 
 
 # =========================================================
-# REFERANS KİMLİK
+# SESSION STATE
+# =========================================================
+
+if "sonuc_df" not in st.session_state:
+    st.session_state.sonuc_df = None
+
+if "excel_data" not in st.session_state:
+    st.session_state.excel_data = None
+
+if "bulunamayanlar" not in st.session_state:
+    st.session_state.bulunamayanlar = []
+
+if "guven_meta" not in st.session_state:
+    st.session_state.guven_meta = []
+
+
+# =========================================================
+# REFERANS
 # =========================================================
 
 REFERANS_YOLU = "referans_kimlik.jpg"
@@ -39,17 +62,7 @@ if not os.path.exists(REFERANS_YOLU):
         "❌ referans_kimlik.jpg bulunamadı."
     )
 
-    st.info(
-        "referans_kimlik.jpg dosyasını web.py ile aynı klasöre koy."
-    )
-
     st.stop()
-
-else:
-
-    st.success(
-        "✅ Referans kimlik bulundu."
-    )
 
 
 # =========================================================
@@ -58,41 +71,39 @@ else:
 
 with st.sidebar:
 
-    st.header("Debug Ayarları")
+    st.header("Ayarlar")
 
     debug_modu = st.checkbox(
         "Debug görüntülerini göster",
-        value=True
+        value=False
     )
 
     kart_siniri_goster = st.checkbox(
-        "Bulunan kart sınırını göster",
-        value=True
-    )
-
-    paddle_debug_goster = st.checkbox(
-        "PaddleOCR kutularını göster",
-        value=True
-    )
-
-    label_debug_goster = st.checkbox(
-        "Ad / Soyad label debug göster",
-        value=True
-    )
-
-    ham_ocr_goster = st.checkbox(
-        "PaddleOCR'ın gördüğü metinleri göster",
-        value=True
+        "Kart sınırını göster",
+        value=False
     )
 
     feature_debug = st.checkbox(
-        "SIFT feature eşleşmelerini göster",
+        "SIFT eşleşmelerini göster",
+        value=False
+    )
+
+    ham_ocr_goster = st.checkbox(
+        "Ham OCR sonuçlarını göster",
         value=False
     )
 
 
+debug_aktif = (
+    debug_modu
+    or kart_siniri_goster
+    or feature_debug
+    or ham_ocr_goster
+)
+
+
 # =========================================================
-# DOSYA YÜKLEME
+# DOSYA YÜKLE
 # =========================================================
 
 dosyalar = st.file_uploader(
@@ -108,7 +119,263 @@ dosyalar = st.file_uploader(
 
 
 # =========================================================
-# DOSYALAR VARSA
+# SAYFA NO
+# =========================================================
+
+def sayfa_no_bul(isim):
+
+    eslesme = re.search(
+        r"Sayfa\s+(\d+)",
+        isim,
+        re.IGNORECASE
+    )
+
+    if eslesme:
+
+        return int(
+            eslesme.group(1)
+        )
+
+    # Direkt resim yüklenmişse PDF sayfası yok
+    return "-"
+
+
+# =========================================================
+# ÖNİZLEME RESMİ
+# =========================================================
+
+def onizleme_hazirla(resim):
+    """
+    Bulunamayan kimlikler için session_state içerisinde
+    dev görüntü tutmamak adına küçük JPEG oluşturur.
+    """
+
+    if resim is None:
+        return None
+
+    h, w = resim.shape[:2]
+
+    maksimum = 1000
+
+    if max(h, w) > maksimum:
+
+        oran = (
+            maksimum
+            /
+            max(h, w)
+        )
+
+        resim = cv2.resize(
+            resim,
+            None,
+            fx=oran,
+            fy=oran,
+            interpolation=cv2.INTER_AREA
+        )
+
+    basarili, encoded = cv2.imencode(
+        ".jpg",
+        resim,
+        [
+            cv2.IMWRITE_JPEG_QUALITY,
+            80
+        ]
+    )
+
+    if not basarili:
+        return None
+
+    return encoded.tobytes()
+
+
+# =========================================================
+# EXCEL
+# =========================================================
+
+def excel_olustur(
+    df,
+    guven_meta
+):
+
+    buffer = BytesIO()
+
+    df.to_excel(
+        buffer,
+        index=False,
+        engine="openpyxl"
+    )
+
+    buffer.seek(0)
+
+    wb = load_workbook(
+        buffer
+    )
+
+    ws = wb.active
+
+    ws.title = "Kimlik Sonuçları"
+
+
+    # =====================================================
+    # RENKLER
+    # =====================================================
+
+    kirmizi = PatternFill(
+        fill_type="solid",
+        fgColor="FFC7CE"
+    )
+
+    sari = PatternFill(
+        fill_type="solid",
+        fgColor="FFF2CC"
+    )
+
+    yesil = PatternFill(
+        fill_type="solid",
+        fgColor="E2F0D9"
+    )
+
+
+    # =====================================================
+    # BAŞLIK
+    # =====================================================
+
+    for hucre in ws[1]:
+
+        hucre.font = Font(
+            bold=True
+        )
+
+        hucre.alignment = Alignment(
+            horizontal="center"
+        )
+
+
+    basliklar = {
+        cell.value: cell.column
+        for cell in ws[1]
+    }
+
+    tc_col = basliklar["T.C."]
+    ad_col = basliklar["Ad"]
+    soyad_col = basliklar["Soyad"]
+
+
+    # =====================================================
+    # RENKLENDİR
+    # =====================================================
+
+    for index, meta in enumerate(
+        guven_meta,
+        start=2
+    ):
+
+        tc_hucre = ws.cell(
+            index,
+            tc_col
+        )
+
+        ad_hucre = ws.cell(
+            index,
+            ad_col
+        )
+
+        soyad_hucre = ws.cell(
+            index,
+            soyad_col
+        )
+
+
+        # -------------------------------------------------
+        # TC
+        # -------------------------------------------------
+
+        if meta["tc_bulundu"]:
+
+            tc_hucre.fill = yesil
+
+        else:
+
+            tc_hucre.fill = kirmizi
+
+
+        # -------------------------------------------------
+        # AD
+        # -------------------------------------------------
+
+        ad_conf = meta["ad_conf"]
+
+        if not meta["ad_bulundu"]:
+
+            ad_hucre.fill = kirmizi
+
+        elif ad_conf < 0.50:
+
+            ad_hucre.fill = kirmizi
+
+        elif ad_conf < 0.70:
+
+            ad_hucre.fill = sari
+
+
+        # -------------------------------------------------
+        # SOYAD
+        # -------------------------------------------------
+
+        soyad_conf = meta[
+            "soyad_conf"
+        ]
+
+        if not meta["soyad_bulundu"]:
+
+            soyad_hucre.fill = kirmizi
+
+        elif soyad_conf < 0.50:
+
+            soyad_hucre.fill = kirmizi
+
+        elif soyad_conf < 0.70:
+
+            soyad_hucre.fill = sari
+
+
+    # =====================================================
+    # GENİŞLİKLER
+    # =====================================================
+
+    genislikler = {
+        "A": 12,
+        "B": 18,
+        "C": 25,
+        "D": 25
+    }
+
+    for kolon, genislik in (
+        genislikler.items()
+    ):
+
+        ws.column_dimensions[
+            kolon
+        ].width = genislik
+
+
+    # =====================================================
+    # ÇIKTI
+    # =====================================================
+
+    sonuc = BytesIO()
+
+    wb.save(
+        sonuc
+    )
+
+    sonuc.seek(0)
+
+    return sonuc.getvalue()
+
+
+# =========================================================
+# İŞLEM
 # =========================================================
 
 if dosyalar:
@@ -118,111 +385,143 @@ if dosyalar:
         type="primary"
     ):
 
-        gecici_klasor = tempfile.mkdtemp()
+        # Eski sonucu temizle
+        st.session_state.sonuc_df = None
+        st.session_state.excel_data = None
+        st.session_state.bulunamayanlar = []
+        st.session_state.guven_meta = []
+
+
+        gecici_klasor = (
+            tempfile.mkdtemp()
+        )
 
         islenecekler = []
 
         tum_sonuclar = []
+
+        guven_meta = []
+
+        bulunamayanlar = []
 
 
         # =================================================
         # DOSYALARI HAZIRLA
         # =================================================
 
-        with st.spinner(
+        durum = st.empty()
+
+        durum.write(
             "Dosyalar hazırlanıyor..."
-        ):
+        )
 
-            for dosya in dosyalar:
 
-                dosya_yolu = os.path.join(
-                    gecici_klasor,
-                    dosya.name
+        for dosya in dosyalar:
+
+            dosya_yolu = os.path.join(
+                gecici_klasor,
+                dosya.name
+            )
+
+
+            with open(
+                dosya_yolu,
+                "wb"
+            ) as f:
+
+                f.write(
+                    dosya.getbuffer()
                 )
 
-                with open(
-                    dosya_yolu,
-                    "wb"
-                ) as f:
 
-                    f.write(
-                        dosya.getbuffer()
+            # =============================================
+            # PDF
+            # =============================================
+
+            if dosya.name.lower().endswith(
+                ".pdf"
+            ):
+
+                try:
+
+                    doc = pymupdf.open(
+                        dosya_yolu
                     )
 
 
-                # =========================================
-                # PDF
-                # =========================================
+                    for sayfa_no, sayfa in enumerate(
+                        doc,
+                        start=1
+                    ):
 
-                if dosya.name.lower().endswith(
-                    ".pdf"
-                ):
-
-                    try:
-
-                        doc = pymupdf.open(
-                            dosya_yolu
-                        )
-
-                        for sayfa_no, sayfa in enumerate(
-                            doc
-                        ):
-
-                            # OCR için yüksek kalite
-                            pix = sayfa.get_pixmap(
+                        pix = (
+                            sayfa.get_pixmap(
                                 dpi=300
                             )
+                        )
 
-                            sayfa_yolu = os.path.join(
+
+                        sayfa_yolu = (
+                            os.path.join(
                                 gecici_klasor,
                                 (
                                     f"{os.path.splitext(dosya.name)[0]}"
-                                    f"_sayfa_{sayfa_no + 1}.png"
+                                    f"_sayfa_{sayfa_no}.png"
                                 )
                             )
-
-                            pix.save(
-                                sayfa_yolu
-                            )
-
-                            islenecekler.append(
-                                {
-                                    "isim": (
-                                        f"{dosya.name} "
-                                        f"- Sayfa {sayfa_no + 1}"
-                                    ),
-                                    "yol": sayfa_yolu
-                                }
-                            )
-
-                        doc.close()
-
-                    except Exception as e:
-
-                        st.error(
-                            f"{dosya.name} PDF dosyası açılamadı: {e}"
                         )
 
 
-                # =========================================
-                # FOTOĞRAF
-                # =========================================
+                        pix.save(
+                            sayfa_yolu
+                        )
 
-                else:
 
-                    islenecekler.append(
-                        {
-                            "isim": dosya.name,
-                            "yol": dosya_yolu
-                        }
+                        islenecekler.append({
+                            "isim": (
+                                f"{dosya.name} "
+                                f"- Sayfa {sayfa_no}"
+                            ),
+
+                            "sayfa_no":
+                                sayfa_no,
+
+                            "yol":
+                                sayfa_yolu
+                        })
+
+
+                    doc.close()
+
+
+                except Exception as e:
+
+                    st.error(
+                        f"{dosya.name} PDF hatası: {e}"
                     )
 
 
-        # =================================================
-        # DOSYA YOKSA
-        # =================================================
+            # =============================================
+            # RESİM
+            # =============================================
+
+            else:
+
+                islenecekler.append({
+                    "isim":
+                        dosya.name,
+
+                    "sayfa_no":
+                        "-",
+
+                    "yol":
+                        dosya_yolu
+                })
+
 
         if not islenecekler:
+
+            durum.empty()
 
             st.warning(
                 "İşlenecek görüntü bulunamadı."
@@ -235,35 +534,54 @@ if dosyalar:
         # PROGRESS
         # =================================================
 
-        progress = st.progress(0)
-
         toplam = len(
             islenecekler
         )
 
+        progress = st.progress(0)
+
 
         # =================================================
-        # HER GÖRSELİ İŞLE
+        # HER SAYFA
         # =================================================
 
         for index, bilgi in enumerate(
             islenecekler
         ):
 
-            dosya_adi = bilgi["isim"]
+            dosya_adi = (
+                bilgi["isim"]
+            )
 
-            yol = bilgi["yol"]
+            sayfa_no = (
+                bilgi["sayfa_no"]
+            )
 
-            st.divider()
-
-            st.header(
-                f"📄 {dosya_adi}"
+            yol = (
+                bilgi["yol"]
             )
 
 
-            # =================================================
-            # GÖRSELİ OKU
-            # =================================================
+            durum.write(
+                (
+                    f"Kimlikler işleniyor... "
+                    f"{index + 1} / {toplam}"
+                )
+            )
+
+
+            if debug_aktif:
+
+                st.divider()
+
+                st.subheader(
+                    f"📄 {dosya_adi}"
+                )
+
+
+            # =============================================
+            # RESİM OKU
+            # =============================================
 
             try:
 
@@ -277,652 +595,673 @@ if dosyalar:
                     cv2.IMREAD_COLOR
                 )
 
-            except Exception as e:
+
+            except Exception:
 
                 resim = None
 
-                st.error(
-                    f"Görüntü okunurken hata oluştu: {e}"
-                )
+
+            # =============================================
+            # DEFAULT
+            # =============================================
+
+            tc_no = "Bulunamadi"
+            ad = "Bulunamadi"
+            soyad = "Bulunamadi"
+
+            ad_conf = 0.0
+            soyad_conf = 0.0
 
 
-            # =================================================
-            # DEFAULT SONUÇ
-            # =================================================
-
-            satir = {
-
-                "Dosya": dosya_adi,
-
-                "T.C.": "Bulunamadi",
-
-                "Ad": "Bulunamadi",
-
-                "Soyad": "Bulunamadi",
-
-                "Güven": "dusuk"
-            }
-
-
-            # =================================================
-            # GÖRÜNTÜ OKUNAMADI
-            # =================================================
+            # =============================================
+            # RESİM OKUNAMADI
+            # =============================================
 
             if resim is None:
 
-                st.error(
-                    "❌ Görüntü okunamadı."
-                )
+                tum_sonuclar.append({
+                    "Sayfa No":
+                        sayfa_no,
 
-                tum_sonuclar.append(
-                    satir
-                )
+                    "T.C.":
+                        tc_no,
+
+                    "Ad":
+                        ad,
+
+                    "Soyad":
+                        soyad
+                })
+
+
+                guven_meta.append({
+                    "tc_bulundu":
+                        False,
+
+                    "ad_bulundu":
+                        False,
+
+                    "soyad_bulundu":
+                        False,
+
+                    "ad_conf":
+                        0.0,
+
+                    "soyad_conf":
+                        0.0
+                })
+
+
+                bulunamayanlar.append({
+                    "sayfa_no":
+                        sayfa_no,
+
+                    "dosya":
+                        dosya_adi,
+
+                    "eksik":
+                        "T.C., Ad, Soyad",
+
+                    "resim":
+                        None
+                })
+
 
                 progress.progress(
-                    (index + 1) / toplam
+                    (index + 1)
+                    /
+                    toplam
                 )
 
                 continue
 
 
-            # =================================================
-            # 1. KART TESPİTİ
-            # =================================================
+            # =============================================
+            # KART TESPİTİ
+            # =============================================
 
-            with st.spinner(
-                "Kimlik kartı aranıyor..."
-            ):
+            try:
 
-                try:
-
-                    kart_sonuc = kart_tespit_et_ve_duzelt(
+                kart_sonuc = (
+                    kart_tespit_et_ve_duzelt(
                         resim,
-                        REFERANS_YOLU
-                    )
+                        REFERANS_YOLU,
 
-                except Exception as e:
+                        debug_match=(
+                            feature_debug
+                        ),
+
+                        debug_kart=(
+                            kart_siniri_goster
+                        )
+                    )
+                )
+
+            except Exception as e:
+
+                kart_sonuc = {
+                    "basarili": False
+                }
+
+                if debug_aktif:
 
                     st.error(
-                        f"Kart tespitinde hata oluştu: {e}"
+                        f"Kart tespit hatası: {e}"
                     )
 
-                    tum_sonuclar.append(
-                        satir
-                    )
 
-                    progress.progress(
-                        (index + 1) / toplam
-                    )
-
-                    continue
-
-
-            # =================================================
-            # FEATURE İSTATİSTİKLERİ
-            # =================================================
-
-            c1, c2, c3 = st.columns(3)
-
-            c1.metric(
-                "Feature sistemi",
-                kart_sonuc.get(
-                    "detector",
-                    "-"
-                )
-                or "-"
-            )
-
-            c2.metric(
-                "İyi eşleşme",
-                kart_sonuc.get(
-                    "iyi_eslesme",
-                    0
-                )
-            )
-
-            c3.metric(
-                "RANSAC Inlier",
-                kart_sonuc.get(
-                    "inlier",
-                    0
-                )
-            )
-
-
-            # =================================================
+            # =============================================
             # KART BULUNAMADI
-            # =================================================
+            # =============================================
 
             if not kart_sonuc.get(
                 "basarili",
                 False
             ):
 
-                st.error(
-                    "❌ Kimlik kartı tespit edilemedi."
-                )
+                tum_sonuclar.append({
+                    "Sayfa No":
+                        sayfa_no,
 
-                st.warning(
-                    kart_sonuc.get(
-                        "mesaj",
-                        "Bilinmeyen kart tespit hatası."
-                    )
-                )
+                    "T.C.":
+                        tc_no,
 
-                st.write(
-                    "### Orijinal görüntü"
-                )
+                    "Ad":
+                        ad,
 
-                st.image(
-                    cv2.cvtColor(
-                        resim,
-                        cv2.COLOR_BGR2RGB
-                    ),
-                    use_container_width=True
-                )
+                    "Soyad":
+                        soyad
+                })
 
 
-                # ---------------------------------------------
-                # FEATURE DEBUG
-                # ---------------------------------------------
+                guven_meta.append({
+                    "tc_bulundu":
+                        False,
 
-                match_debug = kart_sonuc.get(
-                    "match_debug"
-                )
+                    "ad_bulundu":
+                        False,
 
-                if (
-                    feature_debug
-                    and
-                    match_debug is not None
-                ):
+                    "soyad_bulundu":
+                        False,
 
-                    with st.expander(
-                        "🧩 SIFT feature eşleşmeleri",
-                        expanded=False
-                    ):
+                    "ad_conf":
+                        0.0,
 
-                        st.image(
-                            cv2.cvtColor(
-                                match_debug,
-                                cv2.COLOR_BGR2RGB
-                            ),
-                            use_container_width=True
+                    "soyad_conf":
+                        0.0
+                })
+
+
+                bulunamayanlar.append({
+                    "sayfa_no":
+                        sayfa_no,
+
+                    "dosya":
+                        dosya_adi,
+
+                    "eksik":
+                        "Kart tespit edilemedi",
+
+                    "resim":
+                        onizleme_hazirla(
+                            resim
                         )
+                })
 
-
-                tum_sonuclar.append(
-                    satir
-                )
 
                 progress.progress(
-                    (index + 1) / toplam
+                    (index + 1)
+                    /
+                    toplam
                 )
 
                 continue
 
-
-            # =================================================
-            # KART BULUNDU
-            # =================================================
-
-            st.success(
-                "✅ Kimlik kartı tespit edildi."
-            )
 
             kart = kart_sonuc.get(
                 "kart"
             )
 
-            if kart is None:
 
-                st.error(
-                    "Kart bulundu ancak perspektif sonucu alınamadı."
+            # =============================================
+            # OCR
+            # =============================================
+
+            try:
+
+                ocr_sonuc = (
+                    bilgileri_cimbizla(
+                        kart,
+
+                        debug=(
+                            debug_modu
+                            or
+                            ham_ocr_goster
+                        )
+                    )
                 )
 
-                tum_sonuclar.append(
-                    satir
+
+                tc_no = ocr_sonuc.get(
+                    "tc_no",
+                    "Bulunamadi"
                 )
 
-                progress.progress(
-                    (index + 1) / toplam
+                ad = ocr_sonuc.get(
+                    "ad",
+                    "Bulunamadi"
                 )
 
-                continue
+                soyad = ocr_sonuc.get(
+                    "soyad",
+                    "Bulunamadi"
+                )
+
+                ad_conf = float(
+                    ocr_sonuc.get(
+                        "ad_conf",
+                        0.0
+                    )
+                )
+
+                soyad_conf = float(
+                    ocr_sonuc.get(
+                        "soyad_conf",
+                        0.0
+                    )
+                )
 
 
-            # =================================================
-            # KART DEBUG
-            # =================================================
+            except Exception as e:
 
-            if debug_modu:
+                if debug_aktif:
 
-                col1, col2 = st.columns(2)
-
-                # ---------------------------------------------
-                # ORİJİNAL
-                # ---------------------------------------------
-
-                with col1:
-
-                    st.write(
-                        "### 1. Orijinal görüntü"
+                    st.error(
+                        f"OCR hatası: {e}"
                     )
 
-                    st.image(
-                        cv2.cvtColor(
-                            resim,
-                            cv2.COLOR_BGR2RGB
+                ocr_sonuc = {}
+
+
+            # =============================================
+            # EXCEL SATIRI
+            # =============================================
+
+            tum_sonuclar.append({
+                "Sayfa No":
+                    sayfa_no,
+
+                "T.C.":
+                    tc_no,
+
+                "Ad":
+                    ad,
+
+                "Soyad":
+                    soyad
+            })
+
+
+            # =============================================
+            # CONFIDENCE META
+            # =============================================
+
+            tc_bulundu = (
+                tc_no
+                !=
+                "Bulunamadi"
+            )
+
+            ad_bulundu = (
+                ad
+                !=
+                "Bulunamadi"
+            )
+
+            soyad_bulundu = (
+                soyad
+                !=
+                "Bulunamadi"
+            )
+
+
+            guven_meta.append({
+                "tc_bulundu":
+                    tc_bulundu,
+
+                "ad_bulundu":
+                    ad_bulundu,
+
+                "soyad_bulundu":
+                    soyad_bulundu,
+
+                "ad_conf":
+                    ad_conf,
+
+                "soyad_conf":
+                    soyad_conf
+            })
+
+
+            # =============================================
+            # EKSİK ALANLAR
+            # =============================================
+
+            eksikler = []
+
+
+            if not tc_bulundu:
+
+                eksikler.append(
+                    "T.C."
+                )
+
+
+            if not ad_bulundu:
+
+                eksikler.append(
+                    "Ad"
+                )
+
+
+            if not soyad_bulundu:
+
+                eksikler.append(
+                    "Soyad"
+                )
+
+
+            # =============================================
+            # BULUNAMAYANLARA EKLE
+            # =============================================
+
+            if eksikler:
+
+                # Mümkünse düzeltilmiş kartı göster.
+                # Kart yoksa orijinal sayfayı göster.
+
+                gosterilecek_resim = (
+                    kart
+                    if kart is not None
+                    else resim
+                )
+
+
+                bulunamayanlar.append({
+                    "sayfa_no":
+                        sayfa_no,
+
+                    "dosya":
+                        dosya_adi,
+
+                    "eksik":
+                        ", ".join(
+                            eksikler
                         ),
-                        use_container_width=True
+
+                    "resim":
+                        onizleme_hazirla(
+                            gosterilecek_resim
+                        )
+                })
+
+
+            # =============================================
+            # DEBUG
+            # =============================================
+
+            if debug_aktif:
+
+                st.write(
+                    f"**T.C.:** {tc_no}"
+                )
+
+                st.write(
+                    f"**Ad:** {ad}"
+                )
+
+                st.write(
+                    f"**Soyad:** {soyad}"
+                )
+
+
+                if kart_siniri_goster:
+
+                    kart_debug = (
+                        kart_sonuc.get(
+                            "debug_resmi"
+                        )
                     )
 
-
-                # ---------------------------------------------
-                # KART SINIRI
-                # ---------------------------------------------
-
-                with col2:
-
-                    st.write(
-                        "### 2. Bulunan kimlik sınırı"
-                    )
-
-                    kart_debug = kart_sonuc.get(
-                        "debug_resmi"
-                    )
-
-                    if (
-                        kart_siniri_goster
-                        and
-                        kart_debug is not None
-                    ):
+                    if kart_debug is not None:
 
                         st.image(
                             cv2.cvtColor(
                                 kart_debug,
                                 cv2.COLOR_BGR2RGB
                             ),
+                            caption="Kart sınırı",
                             use_container_width=True
                         )
 
-                    else:
 
-                        st.info(
-                            "Kart sınırı debug kapalı."
+                if debug_modu:
+
+                    ocr_debug = (
+                        ocr_sonuc.get(
+                            "debug_resmi"
+                        )
+                    )
+
+                    if ocr_debug is not None:
+
+                        st.image(
+                            cv2.cvtColor(
+                                ocr_debug,
+                                cv2.COLOR_BGR2RGB
+                            ),
+                            caption="TC / Ad / Soyad",
+                            use_container_width=True
                         )
 
 
-            # =================================================
-            # PERSPEKTİF SONUCU
-            # =================================================
+                if feature_debug:
 
-            st.write(
-                "## ✅ Perspektifi düzeltilmiş kart"
-            )
-
-            st.image(
-                cv2.cvtColor(
-                    kart,
-                    cv2.COLOR_BGR2RGB
-                ),
-                use_container_width=True
-            )
-
-
-            # =================================================
-            # SIFT DEBUG
-            # =================================================
-
-            match_debug = kart_sonuc.get(
-                "match_debug"
-            )
-
-            if (
-                feature_debug
-                and
-                match_debug is not None
-            ):
-
-                with st.expander(
-                    "🧩 SIFT feature eşleşmelerini göster",
-                    expanded=False
-                ):
-
-                    st.image(
-                        cv2.cvtColor(
-                            match_debug,
-                            cv2.COLOR_BGR2RGB
-                        ),
-                        use_container_width=True
-                    )
-
-
-            # =================================================
-            # 2. OCR
-            # =================================================
-
-            st.write(
-                "## 🔎 PaddleOCR"
-            )
-
-            with st.spinner(
-                "Kart üzerindeki yazılar aranıyor..."
-            ):
-
-                try:
-
-                    ocr_sonuc = bilgileri_cimbizla(
-                        kart
-                    )
-
-                except Exception as e:
-
-                    st.error(
-                        f"OCR sırasında hata oluştu: {e}"
-                    )
-
-                    tum_sonuclar.append(
-                        satir
-                    )
-
-                    progress.progress(
-                        (index + 1) / toplam
-                    )
-
-                    continue
-
-
-            # =================================================
-            # OCR SONUCU
-            # =================================================
-
-            tc_no = ocr_sonuc.get(
-                "tc_no",
-                "Bulunamadi"
-            )
-
-            ad = ocr_sonuc.get(
-                "ad",
-                "Bulunamadi"
-            )
-
-            soyad = ocr_sonuc.get(
-                "soyad",
-                "Bulunamadi"
-            )
-
-            guven = ocr_sonuc.get(
-                "guven",
-                "dusuk"
-            )
-
-
-            satir["T.C."] = tc_no
-            satir["Ad"] = ad
-            satir["Soyad"] = soyad
-            satir["Güven"] = guven
-
-            tum_sonuclar.append(
-                satir
-            )
-
-
-            # =================================================
-            # SONUÇ METRİKLERİ
-            # =================================================
-
-            st.write(
-                "### Çıkarılan bilgiler"
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-
-            c1.metric(
-                "T.C.",
-                tc_no
-            )
-
-            c2.metric(
-                "Ad",
-                ad
-            )
-
-            c3.metric(
-                "Soyad",
-                soyad
-            )
-
-            c4.metric(
-                "Güven",
-                guven
-            )
-
-
-            # =================================================
-            # PADDLE TEXT DETECTION DEBUG
-            # =================================================
-
-            paddle_debug = ocr_sonuc.get(
-                "paddle_debug"
-            )
-
-            if (
-                debug_modu
-                and
-                paddle_debug_goster
-                and
-                paddle_debug is not None
-            ):
-
-                st.write(
-                    "## 🎯 PaddleOCR nereleri metin olarak görüyor?"
-                )
-
-                st.image(
-                    cv2.cvtColor(
-                        paddle_debug,
-                        cv2.COLOR_BGR2RGB
-                    ),
-                    use_container_width=True
-                )
-
-                st.caption(
-                    "Yeşil kutular PaddleOCR'ın metin olarak algıladığı "
-                    "alanlardır. Kırmızı numaralar aşağıdaki OCR listesiyle "
-                    "eşleşir."
-                )
-
-
-            # =================================================
-            # AD / SOYAD LABEL DEBUG
-            # =================================================
-
-            label_debug = ocr_sonuc.get(
-                "debug_resmi"
-            )
-
-            if (
-                debug_modu
-                and
-                label_debug_goster
-                and
-                label_debug is not None
-            ):
-
-                st.write(
-                    "## 🧭 Ad / Soyad label eşleştirmesi"
-                )
-
-                st.image(
-                    cv2.cvtColor(
-                        label_debug,
-                        cv2.COLOR_BGR2RGB
-                    ),
-                    use_container_width=True
-                )
-
-                st.caption(
-                    "Yeşil kutular OCR alanlarıdır. "
-                    "Sarı çerçeve SOYADI / SURNAME etiketini, "
-                    "turkuaz çerçeve ADI / GIVEN NAME(S) etiketini gösterir."
-                )
-
-
-            # =================================================
-            # HAM OCR
-            # =================================================
-
-            if ham_ocr_goster:
-
-                with st.expander(
-                    "📝 PaddleOCR'ın gördüğü bütün metinleri göster",
-                    expanded=True
-                ):
-
-                    tum_ocr = ocr_sonuc.get(
-                        "tum_ocr",
-                        []
-                    )
-
-                    if tum_ocr:
-
-                        st.success(
-                            f"✅ PaddleOCR toplam {len(tum_ocr)} metin alanı buldu."
+                    match_debug = (
+                        kart_sonuc.get(
+                            "match_debug"
                         )
+                    )
 
-                        for item in tum_ocr:
+                    if match_debug is not None:
 
-                            no = item.get(
-                                "no",
-                                "?"
+                        with st.expander(
+                            "SIFT eşleşmeleri"
+                        ):
+
+                            st.image(
+                                cv2.cvtColor(
+                                    match_debug,
+                                    cv2.COLOR_BGR2RGB
+                                ),
+                                use_container_width=True
                             )
 
-                            metin = item.get(
-                                "metin",
-                                ""
-                            )
 
-                            guven_degeri = item.get(
-                                "guven",
-                                0
-                            )
+                if ham_ocr_goster:
 
-                            x = item.get(
-                                "x",
-                                0
-                            )
+                    with st.expander(
+                        "Ham EasyOCR sonuçları"
+                    ):
 
-                            y = item.get(
-                                "y",
-                                0
+                        for item in (
+                            ocr_sonuc.get(
+                                "tum_ocr",
+                                []
                             )
+                        ):
 
-                            x2 = item.get(
-                                "x2",
-                                0
-                            )
-
-                            y2 = item.get(
-                                "y2",
-                                0
-                            )
-
-                            st.markdown(
-                                f"**{no} — `{metin}`**"
-                            )
-
-                            st.caption(
+                            st.write(
                                 (
-                                    f"Güven: {guven_degeri} "
-                                    f"| Kutu: "
-                                    f"({x}, {y}) → ({x2}, {y2})"
+                                    f'`{item.get("text", "")}` '
+                                    f'— '
+                                    f'{item.get("conf", 0)}'
                                 )
                             )
 
-                    else:
 
-                        st.warning(
-                            "⚠️ PaddleOCR kart üzerinde hiçbir metin "
-                            "tespit edemedi."
-                        )
-
-
-            # =================================================
+            # =============================================
             # PROGRESS
-            # =================================================
+            # =============================================
 
             progress.progress(
-                (index + 1) / toplam
+                (index + 1)
+                /
+                toplam
             )
 
 
-        # =====================================================
-        # PROGRESS BİTTİ
-        # =====================================================
+        # =================================================
+        # TAMAMLANDI
+        # =================================================
 
-        progress.empty()
+        progress.progress(
+            1.0
+        )
+
+        durum.success(
+            f"✅ {toplam} sayfa işlendi."
+        )
 
 
-        # =====================================================
-        # TÜM SONUÇLAR
-        # =====================================================
+        # =================================================
+        # DATAFRAME
+        # =================================================
 
-        if tum_sonuclar:
+        df = pd.DataFrame(
+            tum_sonuclar,
+            columns=[
+                "Sayfa No",
+                "T.C.",
+                "Ad",
+                "Soyad"
+            ]
+        )
 
-            st.divider()
 
-            st.header(
-                "📋 Tüm Kimlik Sonuçları"
-            )
+        # =================================================
+        # EXCEL
+        # =================================================
 
-            df = pd.DataFrame(
-                tum_sonuclar
-            )
+        try:
 
-            st.dataframe(
+            excel_data = excel_olustur(
                 df,
-                use_container_width=True,
-                hide_index=True
+                guven_meta
+            )
+
+        except Exception as e:
+
+            excel_data = None
+
+            st.error(
+                f"Excel oluşturulamadı: {e}"
             )
 
 
-            # =================================================
-            # EXCEL
-            # =================================================
+        # =================================================
+        # SESSION
+        # =================================================
 
-            excel_yolu = os.path.join(
-                gecici_klasor,
+        st.session_state.sonuc_df = (
+            df
+        )
+
+        st.session_state.excel_data = (
+            excel_data
+        )
+
+        st.session_state.bulunamayanlar = (
+            bulunamayanlar
+        )
+
+        st.session_state.guven_meta = (
+            guven_meta
+        )
+
+
+# =========================================================
+# SONUÇ TABLOSU
+# =========================================================
+
+if (
+    st.session_state.sonuc_df
+    is not None
+):
+
+    st.divider()
+
+    st.header(
+        "📋 Sonuçlar"
+    )
+
+
+    st.dataframe(
+        st.session_state.sonuc_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+    # =====================================================
+    # EXCEL İNDİR
+    # =====================================================
+
+    if (
+        st.session_state.excel_data
+        is not None
+    ):
+
+        st.download_button(
+            label="📥 Excel indir",
+
+            data=(
+                st.session_state.excel_data
+            ),
+
+            file_name=(
                 "kimlik_sonuclari.xlsx"
+            ),
+
+            mime=(
+                "application/"
+                "vnd.openxmlformats-officedocument."
+                "spreadsheetml.sheet"
             )
+        )
 
-            try:
 
-                df.to_excel(
-                    excel_yolu,
-                    index=False
+    # =====================================================
+    # BULUNAMAYAN KİMLİKLER
+    # =====================================================
+
+    bulunamayanlar = (
+        st.session_state.bulunamayanlar
+    )
+
+
+    if bulunamayanlar:
+
+        with st.expander(
+            (
+                f"⚠️ Bulunamayan Kimlikler "
+                f"({len(bulunamayanlar)})"
+            ),
+            expanded=False
+        ):
+
+            for item in bulunamayanlar:
+
+                st.markdown(
+                    "---"
                 )
 
-                with open(
-                    excel_yolu,
-                    "rb"
-                ) as f:
 
-                    excel_data = f.read()
+                # PDF ise sayfa numarası
+                if item["sayfa_no"] != "-":
+
+                    st.subheader(
+                        f'📄 Sayfa {item["sayfa_no"]}'
+                    )
+
+                else:
+
+                    st.subheader(
+                        f'📄 {item["dosya"]}'
+                    )
 
 
-                st.download_button(
-                    label="📥 Sonuçları Excel olarak indir",
-                    data=excel_data,
-                    file_name="kimlik_sonuclari.xlsx",
-                    mime=(
-                        "application/"
-                        "vnd.openxmlformats-officedocument."
-                        "spreadsheetml.sheet"
+                st.write(
+                    (
+                        "**Bulunamayan alan:** "
+                        f'{item["eksik"]}'
                     )
                 )
 
-            except Exception as e:
 
-                st.warning(
-                    f"Excel dosyası oluşturulamadı: {e}"
-                )
+                # =========================================
+                # RESİM
+                # =========================================
+
+                if item["resim"] is not None:
+
+                    st.image(
+                        item["resim"],
+                        width=650
+                    )
+
+                else:
+
+                    st.info(
+                        "Bu sayfanın görüntüsü oluşturulamadı."
+                    )

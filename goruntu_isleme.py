@@ -3,8 +3,184 @@ import numpy as np
 import os
 
 
+# =========================================================
+# SABİTLER
+# =========================================================
+
 HEDEF_GENISLIK = 1000
 HEDEF_YUKSEKLIK = 630
+MAX_CALISMA_BOYUTU = 1800
+
+
+# =========================================================
+# CACHE
+# =========================================================
+
+_DETECTOR = None
+_DETECTOR_TIPI = None
+_CLAHE = None
+
+_REFERANS_CACHE = {
+    "yol": None,
+    "mtime": None,
+    "resim": None,
+    "kp": None,
+    "des": None,
+}
+
+
+# =========================================================
+# DETECTOR
+# =========================================================
+
+def detector_getir():
+    global _DETECTOR, _DETECTOR_TIPI
+
+    if _DETECTOR is not None:
+        return _DETECTOR, _DETECTOR_TIPI
+
+    if hasattr(cv2, "SIFT_create"):
+
+        _DETECTOR = cv2.SIFT_create(
+            nfeatures=5000,
+            contrastThreshold=0.02,
+            edgeThreshold=10
+        )
+
+        _DETECTOR_TIPI = "SIFT"
+
+    else:
+
+        _DETECTOR = cv2.ORB_create(
+            nfeatures=6000,
+            scaleFactor=1.2,
+            nlevels=10,
+            edgeThreshold=15,
+            fastThreshold=7
+        )
+
+        _DETECTOR_TIPI = "ORB"
+
+    return _DETECTOR, _DETECTOR_TIPI
+
+
+# =========================================================
+# CLAHE
+# =========================================================
+
+def clahe_getir():
+    global _CLAHE
+
+    if _CLAHE is None:
+
+        _CLAHE = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8, 8)
+        )
+
+    return _CLAHE
+
+
+# =========================================================
+# REFERANSI HAZIRLA
+# =========================================================
+
+def referansi_hazirla(referans_yolu):
+    """
+    Referans kart sadece ilk seferde işlenir.
+    Dosya değişirse cache otomatik yenilenir.
+    """
+
+    global _REFERANS_CACHE
+
+    if not os.path.exists(referans_yolu):
+
+        return (
+            None,
+            None,
+            None,
+            "Referans dosyası bulunamadı."
+        )
+
+    mutlak_yol = os.path.abspath(
+        referans_yolu
+    )
+
+    mtime = os.path.getmtime(
+        mutlak_yol
+    )
+
+    # Cache varsa tekrar hesaplama
+    if (
+        _REFERANS_CACHE["yol"] == mutlak_yol
+        and
+        _REFERANS_CACHE["mtime"] == mtime
+        and
+        _REFERANS_CACHE["resim"] is not None
+        and
+        _REFERANS_CACHE["des"] is not None
+    ):
+
+        return (
+            _REFERANS_CACHE["resim"],
+            _REFERANS_CACHE["kp"],
+            _REFERANS_CACHE["des"],
+            None
+        )
+
+    referans = cv2.imread(
+        mutlak_yol
+    )
+
+    if referans is None:
+
+        return (
+            None,
+            None,
+            None,
+            "Referans görüntüsü okunamadı."
+        )
+
+    detector, _ = detector_getir()
+    clahe = clahe_getir()
+
+    gri = cv2.cvtColor(
+        referans,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    gri = clahe.apply(
+        gri
+    )
+
+    kp, des = detector.detectAndCompute(
+        gri,
+        None
+    )
+
+    if des is None:
+
+        return (
+            None,
+            None,
+            None,
+            "Referansta yeterli feature bulunamadı."
+        )
+
+    _REFERANS_CACHE = {
+        "yol": mutlak_yol,
+        "mtime": mtime,
+        "resim": referans,
+        "kp": kp,
+        "des": des,
+    }
+
+    return (
+        referans,
+        kp,
+        des,
+        None
+    )
 
 
 # =========================================================
@@ -12,40 +188,40 @@ HEDEF_YUKSEKLIK = 630
 # =========================================================
 
 def noktalari_sirala(pts):
-    """
-    4 köşeyi şu sıraya getirir:
 
-    sol üst
-    sağ üst
-    sağ alt
-    sol alt
-    """
+    pts = np.asarray(
+        pts,
+        dtype=np.float32
+    )
 
-    pts = np.asarray(pts, dtype=np.float32)
+    toplam = pts.sum(
+        axis=1
+    )
 
-    rect = np.zeros((4, 2), dtype=np.float32)
+    fark = np.diff(
+        pts,
+        axis=1
+    ).reshape(-1)
 
-    toplam = pts.sum(axis=1)
-
-    rect[0] = pts[np.argmin(toplam)]
-    rect[2] = pts[np.argmax(toplam)]
-
-    fark = np.diff(pts, axis=1).reshape(-1)
-
-    rect[1] = pts[np.argmin(fark)]
-    rect[3] = pts[np.argmax(fark)]
-
-    return rect
+    return np.array(
+        [
+            pts[np.argmin(toplam)],
+            pts[np.argmin(fark)],
+            pts[np.argmax(toplam)],
+            pts[np.argmax(fark)],
+        ],
+        dtype=np.float32
+    )
 
 
 # =========================================================
-# KÖŞELER MANTIKLI MI?
+# KÖŞELER GEÇERLİ Mİ?
 # =========================================================
 
-def koseler_gecerli_mi(koseler, resim_shape):
-    """
-    Homography'nin saçma bir dörtgen üretmesini engeller.
-    """
+def koseler_gecerli_mi(
+    koseler,
+    resim_shape
+):
 
     h, w = resim_shape[:2]
 
@@ -54,94 +230,71 @@ def koseler_gecerli_mi(koseler, resim_shape):
         dtype=np.float32
     ).reshape(4, 2)
 
-    # -----------------------------
-    # Convex dörtgen mi?
-    # -----------------------------
-
     kontur = koseler.astype(
         np.int32
     ).reshape(-1, 1, 2)
 
-    if not cv2.isContourConvex(kontur):
+    if not cv2.isContourConvex(
+        kontur
+    ):
         return False
-
-    # -----------------------------
-    # Alan yeterince büyük mü?
-    # -----------------------------
 
     alan = abs(
-        cv2.contourArea(kontur)
+        cv2.contourArea(
+            kontur
+        )
     )
 
-    resim_alani = h * w
+    alan_orani = alan / (
+        h * w
+    )
 
-    alan_orani = alan / resim_alani
-
-    # Görselin %2'sinden küçükse
-    # muhtemelen yanlış eşleşmedir.
-    if alan_orani < 0.02:
+    if not 0.02 <= alan_orani <= 1.20:
         return False
-
-    # Tüm görüntüden de büyük olamaz
-    if alan_orani > 1.20:
-        return False
-
-    # -----------------------------
-    # Çok uzakta saçma noktalar var mı?
-    # -----------------------------
 
     tolerans_x = w * 0.25
     tolerans_y = h * 0.25
 
-    for x, y in koseler:
+    if np.any(
+        koseler[:, 0] < -tolerans_x
+    ):
+        return False
 
-        if x < -tolerans_x:
-            return False
+    if np.any(
+        koseler[:, 0] > w + tolerans_x
+    ):
+        return False
 
-        if x > w + tolerans_x:
-            return False
+    if np.any(
+        koseler[:, 1] < -tolerans_y
+    ):
+        return False
 
-        if y < -tolerans_y:
-            return False
+    if np.any(
+        koseler[:, 1] > h + tolerans_y
+    ):
+        return False
 
-        if y > h + tolerans_y:
-            return False
-
-    # -----------------------------
-    # Kart oranı mantıklı mı?
-    # -----------------------------
-
-    sirali = noktalari_sirala(
+    tl, tr, br, bl = noktalari_sirala(
         koseler
     )
 
-    tl, tr, br, bl = sirali
-
-    ust = np.linalg.norm(
-        tr - tl
-    )
-
-    alt = np.linalg.norm(
-        br - bl
-    )
-
-    sol = np.linalg.norm(
-        bl - tl
-    )
-
-    sag = np.linalg.norm(
-        br - tr
-    )
-
     genislik = (
-        ust + alt
+        np.linalg.norm(tr - tl)
+        +
+        np.linalg.norm(br - bl)
     ) / 2
 
     yukseklik = (
-        sol + sag
+        np.linalg.norm(bl - tl)
+        +
+        np.linalg.norm(br - tr)
     ) / 2
 
-    if yukseklik == 0:
+    if min(
+        genislik,
+        yukseklik
+    ) <= 0:
         return False
 
     oran = max(
@@ -152,19 +305,17 @@ def koseler_gecerli_mi(koseler, resim_shape):
         yukseklik
     )
 
-    # Kimlik gerçek oranı ~1.586.
-    # Perspektiften dolayı geniş tolerans.
-    if not 1.15 <= oran <= 2.10:
-        return False
-
-    return True
+    return 1.15 <= oran <= 2.10
 
 
 # =========================================================
-# PERSPEKTİF DÜZELTME
+# PERSPEKTİF
 # =========================================================
 
-def perspektif_duzelt(resim, koseler):
+def perspektif_duzelt(
+    resim,
+    koseler
+):
 
     koseler = np.asarray(
         koseler,
@@ -174,9 +325,21 @@ def perspektif_duzelt(resim, koseler):
     hedef = np.array(
         [
             [0, 0],
-            [HEDEF_GENISLIK - 1, 0],
-            [HEDEF_GENISLIK - 1, HEDEF_YUKSEKLIK - 1],
-            [0, HEDEF_YUKSEKLIK - 1]
+
+            [
+                HEDEF_GENISLIK - 1,
+                0
+            ],
+
+            [
+                HEDEF_GENISLIK - 1,
+                HEDEF_YUKSEKLIK - 1
+            ],
+
+            [
+                0,
+                HEDEF_YUKSEKLIK - 1
+            ],
         ],
         dtype=np.float32
     )
@@ -197,15 +360,7 @@ def perspektif_duzelt(resim, koseler):
         borderMode=cv2.BORDER_REPLICATE
     )
 
-    # -------------------------------------------------
-    # KENAR TEMİZLEME
-    # -------------------------------------------------
-    # Her taraftan yaklaşık %1 kırp.
-    # 1000x630 için:
-    # yatayda ~10 px
-    # dikeyde ~6 px
-    # -------------------------------------------------
-
+    # Küçük kenar temizliği
     margin_x = int(
         HEDEF_GENISLIK * 0.012
     )
@@ -215,11 +370,13 @@ def perspektif_duzelt(resim, koseler):
     )
 
     sonuc = sonuc[
-        margin_y:HEDEF_YUKSEKLIK - margin_y,
-        margin_x:HEDEF_GENISLIK - margin_x
+        margin_y:
+        HEDEF_YUKSEKLIK - margin_y,
+
+        margin_x:
+        HEDEF_GENISLIK - margin_x
     ]
 
-    # Kırptıktan sonra tekrar standart boyuta getir
     sonuc = cv2.resize(
         sonuc,
         (
@@ -230,126 +387,56 @@ def perspektif_duzelt(resim, koseler):
     )
 
     return sonuc
-# =========================================================
-# FEATURE DETECTOR
-# =========================================================
-
-def detector_olustur():
-    """
-    Bilgisayarda SIFT varsa onu kullan.
-    Yoksa ORB'a düş.
-    """
-
-    if hasattr(cv2, "SIFT_create"):
-
-        detector = cv2.SIFT_create(
-            nfeatures=5000,
-            contrastThreshold=0.02,
-            edgeThreshold=10
-        )
-
-        return detector, "SIFT"
-
-    detector = cv2.ORB_create(
-        nfeatures=6000,
-        scaleFactor=1.2,
-        nlevels=10,
-        edgeThreshold=15,
-        fastThreshold=7
-    )
-
-    return detector, "ORB"
 
 
 # =========================================================
-# FEATURE MATCHING
+# FEATURE MATCH
 # =========================================================
 
 def feature_eslestir(
-    referans,
+    kp_ref,
+    des_ref,
     resim
 ):
-    """
-    Referans kimlikle kullanıcının görüntüsünü eşleştirir.
 
-    return:
-        homography
-        iyi_matchler
-        kp_ref
-        kp_resim
-        detector_tipi
-        inlier_sayisi
-    """
+    detector, detector_tipi = detector_getir()
+    clahe = clahe_getir()
 
-    detector, detector_tipi = detector_olustur()
-
-    ref_gri = cv2.cvtColor(
-        referans,
-        cv2.COLOR_BGR2GRAY
-    )
-
-    resim_gri = cv2.cvtColor(
+    gri = cv2.cvtColor(
         resim,
         cv2.COLOR_BGR2GRAY
     )
 
-    # ---------------------------------------------
-    # Kontrast güçlendirme
-    # ---------------------------------------------
-
-    clahe = cv2.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8)
+    gri = clahe.apply(
+        gri
     )
 
-    ref_gri = clahe.apply(
-        ref_gri
+    kp_resim, des_resim = (
+        detector.detectAndCompute(
+            gri,
+            None
+        )
     )
 
-    resim_gri = clahe.apply(
-        resim_gri
-    )
-
-    # ---------------------------------------------
-    # Özellik noktaları
-    # ---------------------------------------------
-
-    kp_ref, des_ref = detector.detectAndCompute(
-        ref_gri,
-        None
-    )
-
-    kp_resim, des_resim = detector.detectAndCompute(
-        resim_gri,
-        None
-    )
-
-    if des_ref is None or des_resim is None:
+    if des_resim is None:
 
         return (
             None,
             [],
-            kp_ref,
             kp_resim,
             detector_tipi,
             0
         )
 
-    # ---------------------------------------------
-    # Matcher
-    # ---------------------------------------------
+    norm = (
+        cv2.NORM_L2
+        if detector_tipi == "SIFT"
+        else cv2.NORM_HAMMING
+    )
 
-    if detector_tipi == "SIFT":
-
-        matcher = cv2.BFMatcher(
-            cv2.NORM_L2
-        )
-
-    else:
-
-        matcher = cv2.BFMatcher(
-            cv2.NORM_HAMMING
-        )
+    matcher = cv2.BFMatcher(
+        norm
+    )
 
     try:
 
@@ -364,15 +451,16 @@ def feature_eslestir(
         return (
             None,
             [],
-            kp_ref,
             kp_resim,
             detector_tipi,
             0
         )
 
-    # ---------------------------------------------
-    # Lowe Ratio Test
-    # ---------------------------------------------
+    ratio = (
+        0.72
+        if detector_tipi == "SIFT"
+        else 0.78
+    )
 
     iyi = []
 
@@ -383,31 +471,21 @@ def feature_eslestir(
 
         m, n = pair
 
-        if detector_tipi == "SIFT":
-            oran = 0.72
-        else:
-            oran = 0.78
+        if m.distance < ratio * n.distance:
 
-        if m.distance < oran * n.distance:
+            iyi.append(
+                m
+            )
 
-            iyi.append(m)
-
-    # Homography için minimum 4 gerekir,
-    # biz daha güvenli davranıyoruz.
     if len(iyi) < 10:
 
         return (
             None,
             iyi,
-            kp_ref,
             kp_resim,
             detector_tipi,
             0
         )
-
-    # ---------------------------------------------
-    # Kaynak / hedef noktaları
-    # ---------------------------------------------
 
     kaynak = np.float32(
         [
@@ -423,10 +501,6 @@ def feature_eslestir(
         ]
     ).reshape(-1, 1, 2)
 
-    # ---------------------------------------------
-    # Homography
-    # ---------------------------------------------
-
     H, mask = cv2.findHomography(
         kaynak,
         hedef,
@@ -439,28 +513,22 @@ def feature_eslestir(
         return (
             None,
             iyi,
-            kp_ref,
             kp_resim,
             detector_tipi,
             0
         )
 
-    inlier_sayisi = int(
-        mask.sum()
-    )
-
     return (
         H,
         iyi,
-        kp_ref,
         kp_resim,
         detector_tipi,
-        inlier_sayisi
+        int(mask.sum())
     )
 
 
 # =========================================================
-# REFERANSIN KÖŞELERİNİ FOTOĞRAFA TAŞI
+# KÖŞELERİ BUL
 # =========================================================
 
 def koseleri_bul(
@@ -475,23 +543,18 @@ def koseleri_bul(
             [0, 0],
             [w - 1, 0],
             [w - 1, h - 1],
-            [0, h - 1]
+            [0, h - 1],
         ]
     ).reshape(-1, 1, 2)
 
-    bulunan = cv2.perspectiveTransform(
+    return cv2.perspectiveTransform(
         ref_koseler,
         H
-    )
-
-    return bulunan.reshape(
-        4,
-        2
-    )
+    ).reshape(4, 2)
 
 
 # =========================================================
-# DEBUG EŞLEŞME RESMİ
+# DEBUG
 # =========================================================
 
 def match_debug_resmi(
@@ -504,7 +567,6 @@ def match_debug_resmi(
 ):
 
     if not matchler:
-
         return None
 
     secilen = sorted(
@@ -512,7 +574,7 @@ def match_debug_resmi(
         key=lambda m: m.distance
     )[:maksimum]
 
-    debug = cv2.drawMatches(
+    return cv2.drawMatches(
         referans,
         kp_ref,
         resim,
@@ -522,228 +584,13 @@ def match_debug_resmi(
         flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
     )
 
-    return debug
 
-
-# =========================================================
-# ANA FONKSİYON
-# =========================================================
-
-def kart_tespit_et_ve_duzelt(
+def kart_debug_resmi(
     resim,
-    referans_yolu="referans_kimlik.jpg"
+    koseler
 ):
-    """
-    ANA AŞAMA
 
-    1. Referans kartı yükle
-    2. SIFT/ORB feature matching
-    3. Homography
-    4. Kart köşelerini hesapla
-    5. Perspective warp
-    """
-
-    sonuc = {
-
-        "basarili": False,
-
-        "kart": None,
-
-        "debug_resmi": None,
-
-        "match_debug": None,
-
-        "koseler": None,
-
-        "iyi_eslesme": 0,
-
-        "inlier": 0,
-
-        "detector": "",
-
-        "mesaj": ""
-    }
-
-    # ---------------------------------------------
-    # Gelen fotoğraf
-    # ---------------------------------------------
-
-    if resim is None:
-
-        sonuc[
-            "mesaj"
-        ] = "Görüntü okunamadı."
-
-        return sonuc
-
-    # ---------------------------------------------
-    # Referans
-    # ---------------------------------------------
-
-    if not os.path.exists(
-        referans_yolu
-    ):
-
-        sonuc[
-            "mesaj"
-        ] = (
-            f"Referans bulunamadı: "
-            f"{referans_yolu}"
-        )
-
-        return sonuc
-
-    referans = cv2.imread(
-        referans_yolu
-    )
-
-    if referans is None:
-
-        sonuc[
-            "mesaj"
-        ] = "Referans kimlik görüntüsü okunamadı."
-
-        return sonuc
-
-    # ---------------------------------------------
-    # Çok büyük resmi küçült
-    #
-    # Sonra köşeleri orijinal ölçeğe geri taşıyoruz.
-    # ---------------------------------------------
-
-    orijinal = resim.copy()
-
-    h, w = resim.shape[:2]
-
-    max_boyut = 1800
-
-    olcek = 1.0
-
-    if max(h, w) > max_boyut:
-
-        olcek = max_boyut / max(
-            h,
-            w
-        )
-
-        calisma = cv2.resize(
-            resim,
-            None,
-            fx=olcek,
-            fy=olcek,
-            interpolation=cv2.INTER_AREA
-        )
-
-    else:
-
-        calisma = resim.copy()
-
-    # ---------------------------------------------
-    # MATCH
-    # ---------------------------------------------
-
-    (
-        H,
-        iyi,
-        kp_ref,
-        kp_resim,
-        detector_tipi,
-        inlier_sayisi
-    ) = feature_eslestir(
-        referans,
-        calisma
-    )
-
-    sonuc[
-        "iyi_eslesme"
-    ] = len(iyi)
-
-    sonuc[
-        "inlier"
-    ] = inlier_sayisi
-
-    sonuc[
-        "detector"
-    ] = detector_tipi
-
-    # ---------------------------------------------
-    # Match debug
-    # ---------------------------------------------
-
-    sonuc[
-        "match_debug"
-    ] = match_debug_resmi(
-        referans,
-        calisma,
-        kp_ref,
-        kp_resim,
-        iyi
-    )
-
-    # ---------------------------------------------
-    # Yetersiz eşleşme
-    # ---------------------------------------------
-
-    if H is None:
-
-        sonuc[
-            "mesaj"
-        ] = (
-            f"Yeterli özellik eşleşmesi yok. "
-            f"İyi eşleşme: {len(iyi)}"
-        )
-
-        return sonuc
-
-    # RANSAC gerçekten kaç eşleşmeyi kabul etti?
-    if inlier_sayisi < 8:
-
-        sonuc[
-            "mesaj"
-        ] = (
-            f"Homography güvenilir değil. "
-            f"Inlier: {inlier_sayisi}"
-        )
-
-        return sonuc
-
-    # ---------------------------------------------
-    # Kart köşelerini bul
-    # ---------------------------------------------
-
-    koseler = koseleri_bul(
-        referans,
-        H
-    )
-
-    # Küçülttüysek orijinale taşı
-    if olcek != 1.0:
-
-        koseler = koseler / olcek
-
-    # ---------------------------------------------
-    # Köşeler mantıklı mı?
-    # ---------------------------------------------
-
-    if not koseler_gecerli_mi(
-        koseler,
-        orijinal.shape
-    ):
-
-        sonuc[
-            "mesaj"
-        ] = (
-            "Feature eşleşmesi bulundu ancak "
-            "hesaplanan kart sınırları mantıklı değil."
-        )
-
-        return sonuc
-
-    # ---------------------------------------------
-    # Debug polygon
-    # ---------------------------------------------
-
-    debug = orijinal.copy()
+    debug = resim.copy()
 
     polygon = koseler.astype(
         np.int32
@@ -758,12 +605,11 @@ def kart_tespit_et_ve_duzelt(
         cv2.LINE_AA
     )
 
-    # Köşelere numara koy
-    for i, nokta in enumerate(
-        koseler.astype(np.int32)
+    for i, (x, y) in enumerate(
+        koseler.astype(
+            np.int32
+        )
     ):
-
-        x, y = nokta
 
         cv2.circle(
             debug,
@@ -786,33 +632,189 @@ def kart_tespit_et_ve_duzelt(
             3
         )
 
-    # ---------------------------------------------
-    # Perspective warp
-    # ---------------------------------------------
+    return debug
+
+
+# =========================================================
+# ANA FONKSİYON
+# =========================================================
+
+def kart_tespit_et_ve_duzelt(
+    resim,
+    referans_yolu="referans_kimlik.jpg",
+    debug_match=False,
+    debug_kart=False
+):
+
+    sonuc = {
+        "basarili": False,
+
+        "kart": None,
+
+        "debug_resmi": None,
+        "match_debug": None,
+
+        "koseler": None,
+
+        "iyi_eslesme": 0,
+        "inlier": 0,
+
+        "detector": "",
+
+        "mesaj": ""
+    }
+
+    if resim is None:
+
+        sonuc["mesaj"] = (
+            "Görüntü okunamadı."
+        )
+
+        return sonuc
+
+    # Referans
+    (
+        referans,
+        kp_ref,
+        des_ref,
+        hata
+    ) = referansi_hazirla(
+        referans_yolu
+    )
+
+    if hata:
+
+        sonuc["mesaj"] = hata
+
+        return sonuc
+
+    # Büyük resmi küçült
+    h, w = resim.shape[:2]
+
+    olcek = 1.0
+
+    if max(h, w) > MAX_CALISMA_BOYUTU:
+
+        olcek = (
+            MAX_CALISMA_BOYUTU
+            /
+            max(h, w)
+        )
+
+        calisma = cv2.resize(
+            resim,
+            None,
+            fx=olcek,
+            fy=olcek,
+            interpolation=cv2.INTER_AREA
+        )
+
+    else:
+
+        calisma = resim
+
+    # Feature matching
+    (
+        H,
+        iyi,
+        kp_resim,
+        detector_tipi,
+        inlier_sayisi
+    ) = feature_eslestir(
+        kp_ref,
+        des_ref,
+        calisma
+    )
+
+    sonuc["iyi_eslesme"] = len(
+        iyi
+    )
+
+    sonuc["inlier"] = (
+        inlier_sayisi
+    )
+
+    sonuc["detector"] = (
+        detector_tipi
+    )
+
+    # Debug sadece istenirse
+    if debug_match:
+
+        sonuc["match_debug"] = (
+            match_debug_resmi(
+                referans,
+                calisma,
+                kp_ref,
+                kp_resim,
+                iyi
+            )
+        )
+
+    if H is None:
+
+        sonuc["mesaj"] = (
+            f"Yeterli özellik eşleşmesi yok. "
+            f"İyi eşleşme: {len(iyi)}"
+        )
+
+        return sonuc
+
+    if inlier_sayisi < 8:
+
+        sonuc["mesaj"] = (
+            f"Homography güvenilir değil. "
+            f"Inlier: {inlier_sayisi}"
+        )
+
+        return sonuc
+
+    koseler = koseleri_bul(
+        referans,
+        H
+    )
+
+    if olcek != 1.0:
+
+        koseler = (
+            koseler
+            /
+            olcek
+        )
+
+    if not koseler_gecerli_mi(
+        koseler,
+        resim.shape
+    ):
+
+        sonuc["mesaj"] = (
+            "Feature eşleşmesi bulundu ancak "
+            "kart sınırları mantıklı değil."
+        )
+
+        return sonuc
 
     kart = perspektif_duzelt(
-        orijinal,
+        resim,
         koseler
     )
 
-    sonuc[
-        "basarili"
-    ] = True
+    if debug_kart:
 
-    sonuc[
-        "kart"
-    ] = kart
+        sonuc["debug_resmi"] = (
+            kart_debug_resmi(
+                resim,
+                koseler
+            )
+        )
 
-    sonuc[
-        "debug_resmi"
-    ] = debug
-
-    sonuc[
-        "koseler"
-    ] = koseler
-
-    sonuc[
-        "mesaj"
-    ] = "Kimlik başarıyla tespit edildi."
+    sonuc.update({
+        "basarili": True,
+        "kart": kart,
+        "koseler": koseler,
+        "mesaj": (
+            "Kimlik başarıyla tespit edildi."
+        )
+    })
 
     return sonuc
