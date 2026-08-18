@@ -23,8 +23,8 @@ reader = easyocr.Reader(
 
 def normalize_text(text):
     """
-    Sadece karşılaştırma için.
-    Gerçek sonuçtaki Türkçe karakterlere dokunmaz.
+    Sadece karşılaştırma için kullanılır.
+    Gerçek isim/soyisim çıktısındaki Türkçe karakterleri bozmaz.
     """
 
     text = str(text).upper().strip()
@@ -56,6 +56,10 @@ def normalize_text(text):
 
 
 def isim_temizle(text):
+    """
+    Ad / soyad çıktısını temizler.
+    Türkçe karakterleri KORUR.
+    """
 
     if not text:
         return ""
@@ -91,22 +95,6 @@ def benzerlik(a, b):
 # =========================================================
 
 def buyuk_harf_orani(text):
-    """
-    Kimlikte gerçek AD / SOYAD değerleri:
-        MERCAN
-        AYNUR
-        GÜLCEMAL
-        AYŞE VERDA
-
-    gibi büyük harfle yazılıyor.
-
-    Label'lar ise:
-        Soyadı
-        Surname
-        Given Name(s)
-
-    gibi title-case / küçük harf ağırlıklı.
-    """
 
     harfler = [
         c
@@ -123,11 +111,7 @@ def buyuk_harf_orani(text):
         if c.isupper()
     )
 
-    return (
-        buyuk
-        /
-        len(harfler)
-    )
+    return buyuk / len(harfler)
 
 
 # =========================================================
@@ -181,9 +165,7 @@ def tc_kimlik_gecerli_mi(no):
         sum(d[1:8:2])
     ) % 10
 
-    d11 = (
-        sum(d[:10]) % 10
-    )
+    d11 = sum(d[:10]) % 10
 
     return (
         d[9] == d10
@@ -204,11 +186,8 @@ def tc_metni_duzelt(text):
         "L": "1",
 
         "Z": "2",
-
         "S": "5",
-
         "G": "6",
-
         "B": "8"
     }
 
@@ -231,7 +210,10 @@ def tc_metni_duzelt(text):
 
 def tc_bul(ocr_sonuclari):
 
-    # 1. Direkt
+    # -----------------------------------------------------
+    # 1. Direkt 11 haneli sayı
+    # -----------------------------------------------------
+
     for item in ocr_sonuclari:
 
         rakamlar = re.sub(
@@ -254,7 +236,10 @@ def tc_bul(ocr_sonuclari):
             )
 
 
-    # 2. OCR düzeltmeli
+    # -----------------------------------------------------
+    # 2. OCR harf/rakam hatalarını düzelt
+    # -----------------------------------------------------
+
     for item in ocr_sonuclari:
 
         aday = tc_metni_duzelt(
@@ -291,12 +276,9 @@ def easyocr_oku(
     offset_y=0
 ):
 
-    baslangic = (
-        time.perf_counter()
-    )
+    baslangic = time.perf_counter()
 
     bulunanlar = []
-
 
     try:
 
@@ -331,7 +313,6 @@ def easyocr_oku(
         text = str(text).strip()
 
         if not text:
-
             continue
 
 
@@ -342,25 +323,33 @@ def easyocr_oku(
 
 
         x1 = (
-            int(box[:, 0].min())
+            int(
+                box[:, 0].min()
+            )
             +
             offset_x
         )
 
         y1 = (
-            int(box[:, 1].min())
+            int(
+                box[:, 1].min()
+            )
             +
             offset_y
         )
 
         x2 = (
-            int(box[:, 0].max())
+            int(
+                box[:, 0].max()
+            )
             +
             offset_x
         )
 
         y2 = (
-            int(box[:, 1].max())
+            int(
+                box[:, 1].max()
+            )
             +
             offset_y
         )
@@ -436,12 +425,6 @@ def fuzzy_label_bul(
     hedefler,
     esik=0.40
 ):
-    """
-    Label confidence düşük olabilir.
-
-    Burada OCR confidence'a değil,
-    metin benzerliğine bakıyoruz.
-    """
 
     en_iyi_item = None
     en_iyi_skor = 0.0
@@ -455,7 +438,6 @@ def fuzzy_label_bul(
                 item["text"],
                 hedef
             )
-
 
             if skor > en_iyi_skor:
 
@@ -472,7 +454,7 @@ def fuzzy_label_bul(
 
 
 # =========================================================
-# LABEL BENZERİ METİN Mİ?
+# LABEL METNİ Mİ?
 # =========================================================
 
 def label_metni_mi(text):
@@ -520,40 +502,20 @@ def label_metni_mi(text):
     ]
 
 
-    if any(
+    return any(
         kelime in norm
         for kelime in sabitler
-    ):
-
-        return True
-
-
-    return False
+    )
 
 
 # =========================================================
-# VALUE ADAYI
+# VALUE ADAYI MI?
 # =========================================================
 
 def isim_value_adayi_mi(
     item,
     label_item=None
 ):
-    """
-    Buradaki EN ÖNEMLİ YENİ KURAL:
-
-    AD / SOYAD değerleri büyük harfli.
-
-    Böylece:
-        Soyadı       ❌
-        Surname      ❌
-        Given Name   ❌
-
-    ama:
-        MERCAN       ✅
-        AYNUR        ✅
-        GÜLCEMAL     ✅
-    """
 
     if item is None:
 
@@ -570,9 +532,36 @@ def isim_value_adayi_mi(
         return False
 
 
-    # -----------------------------------------------------
-    # LABEL METNİ İSE ASLA VALUE OLAMAZ
-    # -----------------------------------------------------
+    norm = normalize_text(
+        text
+    )
+
+
+    # =====================================================
+    # KESİNLİKLE İSİM / SOYİSİM OLAMAZ
+    # =====================================================
+
+    kesin_yasaklar = {
+        "TC",
+        "T C",
+        "TR",
+        "TUR",
+
+        "M",
+        "F",
+        "E",
+        "K"
+    }
+
+
+    if norm in kesin_yasaklar:
+
+        return False
+
+
+    # =====================================================
+    # LABEL İSE VALUE OLAMAZ
+    # =====================================================
 
     if label_metni_mi(
         text
@@ -581,9 +570,54 @@ def isim_value_adayi_mi(
         return False
 
 
-    # -----------------------------------------------------
-    # TAMAMEN SAYI / SEMBOL
-    # -----------------------------------------------------
+    # =====================================================
+    # EK YASAKLI KELİMELER
+    # =====================================================
+
+    yasaklar = [
+        "ADI",
+        "GIVEN",
+        "NAME",
+
+        "SOYADI",
+        "SURNAME",
+
+        "TC",
+        "KIMLIK",
+        "IDENTITY",
+        "TR",
+
+        "DATE",
+        "BIRTH",
+
+        "GENDER",
+        "CINSIYET",
+
+        "DOCUMENT",
+        "SERI",
+
+        "NATIONALITY",
+        "UYRUGU",
+
+        "VALID",
+        "GECERLILIK",
+
+        "SIGNATURE",
+        "IMZASI"
+    ]
+
+
+    if any(
+        kelime in norm
+        for kelime in yasaklar
+    ):
+
+        return False
+
+
+    # =====================================================
+    # SAYI / SEMBOL
+    # =====================================================
 
     if re.fullmatch(
         r"[\d\W]+",
@@ -593,9 +627,9 @@ def isim_value_adayi_mi(
         return False
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # RAKAM İÇERİYORSA ALMA
-    # -----------------------------------------------------
+    # =====================================================
 
     if any(
         c.isdigit()
@@ -605,9 +639,9 @@ def isim_value_adayi_mi(
         return False
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # HARF SAYISI
-    # -----------------------------------------------------
+    # =====================================================
 
     temiz = isim_temizle(
         text
@@ -626,11 +660,9 @@ def isim_value_adayi_mi(
         return False
 
 
-    # -----------------------------------------------------
+    # =====================================================
     # BÜYÜK HARF ORANI
-    #
-    # %80 ve üstünü değer kabul ediyoruz.
-    # -----------------------------------------------------
+    # =====================================================
 
     oran = buyuk_harf_orani(
         text
@@ -642,11 +674,9 @@ def isim_value_adayi_mi(
         return False
 
 
-    # -----------------------------------------------------
-    # VALUE GENELDE LABEL'DAN DAHA BÜYÜK YAZILIYOR
-    #
-    # Bunu sert eleme değil küçük güvenlik olarak kullan.
-    # -----------------------------------------------------
+    # =====================================================
+    # VALUE FONTU LABEL'DAN BARİZ KÜÇÜK OLMASIN
+    # =====================================================
 
     if label_item is not None:
 
@@ -659,7 +689,6 @@ def isim_value_adayi_mi(
         )
 
 
-        # Çok bariz şekilde label'dan küçükse alma.
         if (
             label_h > 0
             and
@@ -675,7 +704,7 @@ def isim_value_adayi_mi(
 
 
 # =========================================================
-# LABEL ALTINDAKİ VALUE'YU BUL
+# LABEL ALTINDAKİ VALUE
 # =========================================================
 
 def label_degerini_bul(
@@ -685,13 +714,6 @@ def label_degerini_bul(
     maksimum_dikey=130,
     maksimum_yatay=220
 ):
-    """
-    Eski çalışan fikre geri dönüş:
-
-    label bul
-       ↓
-    hemen altındaki en mantıklı BÜYÜK HARFLİ value'yu al
-    """
 
     if label_item is None:
 
@@ -737,7 +759,7 @@ def label_degerini_bul(
 
 
         # -------------------------------------------------
-        # SOYAD İÇİN AD LABEL'IN ALTINA GEÇMESİN
+        # SOYAD, AD LABEL'IN ALTINA GEÇMESİN
         # -------------------------------------------------
 
         if (
@@ -767,16 +789,6 @@ def label_degerini_bul(
             continue
 
 
-        # -------------------------------------------------
-        # PUAN
-        #
-        # 1. Dikey yakınlık
-        # 2. Yatay hizalama
-        # 3. Büyük harf oranı
-        # 4. Kutunun label'dan büyük olması
-        # 5. OCR confidence
-        # -------------------------------------------------
-
         value_h = kutu_yuksekligi(
             item
         )
@@ -796,10 +808,14 @@ def label_degerini_bul(
         )
 
 
+        # =================================================
+        # SCORE
+        # =================================================
+
         skor = 0.0
 
 
-        # Yakınlık en önemli
+        # Dikey yakınlık
         skor -= (
             max(
                 0,
@@ -810,6 +826,7 @@ def label_degerini_bul(
         )
 
 
+        # Yatay hizalama
         skor -= (
             yatay_fark
             *
@@ -827,7 +844,7 @@ def label_degerini_bul(
         )
 
 
-        # Değer daha büyük fontsa bonus
+        # Daha büyük font bonusu
         skor += (
             min(
                 boyut_orani,
@@ -838,7 +855,7 @@ def label_degerini_bul(
         )
 
 
-        # OCR confidence artık sadece yardımcı
+        # Confidence yardımcı kriter
         skor += (
             item["conf"]
             *
@@ -846,7 +863,7 @@ def label_degerini_bul(
         )
 
 
-        # Hemen altında
+        # Hemen altındaysa bonus
         if (
             0
             <=
@@ -858,7 +875,7 @@ def label_degerini_bul(
             skor += 35
 
 
-        # Sol taraflar hizalı
+        # Sol hizası yakınsa bonus
         if yatay_fark <= 70:
 
             skor += 20
@@ -884,18 +901,13 @@ def label_degerini_bul(
 
 
 # =========================================================
-# LABEL OKUNAMAZSA FALLBACK
+# FALLBACK
 # =========================================================
 
 def fallback_ad_soyad_bul(
     ocr_sonuclari,
     tc_item
 ):
-    """
-    Sadece label gerçekten bulunamazsa kullanılır.
-
-    TC sonrası BÜYÜK HARFLİ metinleri kullanır.
-    """
 
     if tc_item is None:
 
@@ -936,8 +948,17 @@ def fallback_ad_soyad_bul(
             continue
 
 
-        # Çok sağ tarafı alma
+        # Çok sağdaki alanları alma
         if item["x1"] > 700:
+
+            continue
+
+
+        # =================================================
+        # TC SATIRINA ÇOK YAKIN METİNLER İSİM OLAMAZ
+        # =================================================
+
+        if item["y1"] <= tc_item["y2"] + 20:
 
             continue
 
@@ -955,7 +976,6 @@ def fallback_ad_soyad_bul(
         )
 
 
-    # Yukarıdan aşağı
     adaylar = sorted(
         adaylar,
         key=lambda x: (
@@ -984,7 +1004,10 @@ def fallback_ad_soyad_bul(
 # AYNI KUTU
 # =========================================================
 
-def ayni_item_mi(a, b):
+def ayni_item_mi(
+    a,
+    b
+):
 
     if (
         a is None
@@ -1007,23 +1030,13 @@ def ayni_item_mi(a, b):
 
 
 # =========================================================
-# TÜRKÇE HARF İÇİN SADECE BİRKAÇ PİKSEL GENİŞLET
+# TÜRKÇE HARF İÇİN HAFİF GENİŞLET
 # =========================================================
 
 def isim_kutusunu_hafif_genislet(
     kart,
     item
 ):
-    """
-    SEÇİMİ DEĞİŞTİRMEZ.
-
-    Sadece seçilmiş kutudan alınan crop:
-
-    üst  +5 px
-    alt  +3 px
-    sol  +2 px
-    sağ  +2 px
-    """
 
     if item is None:
 
@@ -1035,6 +1048,8 @@ def isim_kutusunu_hafif_genislet(
     )
 
 
+    # Sadece birkaç piksel.
+    # Kutu seçimine etkisi YOK.
     ust = 5
     alt = 3
 
@@ -1085,17 +1100,6 @@ def turkce_harf_iyilestir(
     kart,
     item
 ):
-    """
-    Burada HANGİ KUTUNUN seçildiği değişmez.
-
-    Sadece:
-
-       GULCEMAL
-          ↓
-       GÜLCEMAL
-
-    gibi düzeltme denenir.
-    """
 
     if item is None:
 
@@ -1186,10 +1190,7 @@ def turkce_harf_iyilestir(
             continue
 
 
-        # =================================================
-        # İKİNCİ OCR BAMBAŞKA KELİME ÜRETEMEZ
-        # =================================================
-
+        # İkinci OCR bambaşka kelime üretemez.
         if (
             normalize_text(
                 ikinci_text
@@ -1278,9 +1279,7 @@ def debug_resmi_olustur(
     ad_item
 ):
 
-    debug = (
-        kart.copy()
-    )
+    debug = kart.copy()
 
 
     # =====================================================
@@ -1567,8 +1566,16 @@ def bilgileri_cimbizla(
         h * 0.15
     )
 
+    # =====================================================
+    # ÖNEMLİ DEĞİŞİKLİK
+    #
+    # 0.62 yerine 0.70
+    #
+    # HALİME gibi aşağıda kalan adlar crop dışında kalmasın.
+    # =====================================================
+
     y2 = int(
-        h * 0.62
+        h * 0.70
     )
 
 
@@ -1634,11 +1641,7 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 5. ESKİ MANTIĞA DÖN:
-    #
-    # LABEL
-    #   ↓
-    # HEMEN ALTINDAKİ BÜYÜK HARFLİ VALUE
+    # 5. LABEL ALTINDAKİ BÜYÜK HARFLİ VALUE
     # =====================================================
 
     soyad_item = (
@@ -1673,8 +1676,6 @@ def bilgileri_cimbizla(
 
     # =====================================================
     # 6. FALLBACK
-    #
-    # LABEL / VALUE gerçekten bulunamadığında.
     # =====================================================
 
     if (
@@ -1720,9 +1721,7 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 8. TÜRKÇE HARF İYİLEŞTİR
-    #
-    # BURADAN SONRA KUTU SEÇİMİ DEĞİŞMEZ.
+    # 8. TÜRKÇE HARF İYİLEŞTİRME
     # =====================================================
 
     (
