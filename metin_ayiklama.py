@@ -22,10 +22,6 @@ reader = easyocr.Reader(
 # =========================================================
 
 def normalize_text(text):
-    """
-    Sadece karşılaştırma için kullanılır.
-    Gerçek isim/soyisim çıktısındaki Türkçe karakterleri bozmaz.
-    """
 
     text = str(text).upper().strip()
 
@@ -56,10 +52,6 @@ def normalize_text(text):
 
 
 def isim_temizle(text):
-    """
-    Ad / soyad çıktısını temizler.
-    Türkçe karakterleri KORUR.
-    """
 
     if not text:
         return ""
@@ -115,7 +107,7 @@ def buyuk_harf_orani(text):
 
 
 # =========================================================
-# KUTU BOYUTLARI
+# KUTU YARDIMCILARI
 # =========================================================
 
 def kutu_yuksekligi(item):
@@ -138,6 +130,18 @@ def kutu_genisligi(item):
         0,
         item["x2"] - item["x1"]
     )
+
+
+def kutu_merkez_x(item):
+
+    if item is None:
+        return 0
+
+    return (
+        item["x1"]
+        +
+        item["x2"]
+    ) / 2
 
 
 # =========================================================
@@ -165,7 +169,11 @@ def tc_kimlik_gecerli_mi(no):
         sum(d[1:8:2])
     ) % 10
 
-    d11 = sum(d[:10]) % 10
+    d11 = (
+        sum(d[:10])
+        %
+        10
+    )
 
     return (
         d[9] == d10
@@ -186,8 +194,11 @@ def tc_metni_duzelt(text):
         "L": "1",
 
         "Z": "2",
+
         "S": "5",
+
         "G": "6",
+
         "B": "8"
     }
 
@@ -211,7 +222,7 @@ def tc_metni_duzelt(text):
 def tc_bul(ocr_sonuclari):
 
     # -----------------------------------------------------
-    # 1. Direkt 11 haneli sayı
+    # 1. Direkt TC
     # -----------------------------------------------------
 
     for item in ocr_sonuclari:
@@ -237,7 +248,7 @@ def tc_bul(ocr_sonuclari):
 
 
     # -----------------------------------------------------
-    # 2. OCR harf/rakam hatalarını düzelt
+    # 2. OCR hata düzeltmeli TC
     # -----------------------------------------------------
 
     for item in ocr_sonuclari:
@@ -267,7 +278,7 @@ def tc_bul(ocr_sonuclari):
 
 
 # =========================================================
-# EASYOCR
+# ANA EASYOCR
 # =========================================================
 
 def easyocr_oku(
@@ -276,9 +287,12 @@ def easyocr_oku(
     offset_y=0
 ):
 
-    baslangic = time.perf_counter()
+    baslangic = (
+        time.perf_counter()
+    )
 
     bulunanlar = []
+
 
     try:
 
@@ -310,7 +324,10 @@ def easyocr_oku(
             continue
 
 
-        text = str(text).strip()
+        text = str(
+            text
+        ).strip()
+
 
         if not text:
             continue
@@ -439,6 +456,7 @@ def fuzzy_label_bul(
                 hedef
             )
 
+
             if skor > en_iyi_skor:
 
                 en_iyi_skor = skor
@@ -462,6 +480,7 @@ def label_metni_mi(text):
     norm = normalize_text(
         text
     )
+
 
     if not norm:
 
@@ -509,6 +528,55 @@ def label_metni_mi(text):
 
 
 # =========================================================
+# CİNSİYET DEĞERİ Mİ?
+# =========================================================
+
+def cinsiyet_degeri_mi(text):
+    """
+    Bunların yanlışlıkla AD/SOYAD seçilmesini engeller:
+
+    K/F
+    K / F
+    K F
+
+    E/M
+    E / M
+    E M
+
+    M/F
+    F/M
+    """
+
+    norm = normalize_text(
+        text
+    )
+
+
+    # Normalize sonrası:
+    # K / F -> K F
+    # E / M -> E M
+
+    yasak = {
+        "K",
+        "F",
+        "E",
+        "M",
+
+        "K F",
+        "F K",
+
+        "E M",
+        "M E",
+
+        "M F",
+        "F M"
+    }
+
+
+    return norm in yasak
+
+
+# =========================================================
 # VALUE ADAYI MI?
 # =========================================================
 
@@ -538,19 +606,14 @@ def isim_value_adayi_mi(
 
 
     # =====================================================
-    # KESİNLİKLE İSİM / SOYİSİM OLAMAZ
+    # KESİN YASAKLAR
     # =====================================================
 
     kesin_yasaklar = {
         "TC",
         "T C",
         "TR",
-        "TUR",
-
-        "M",
-        "F",
-        "E",
-        "K"
+        "TUR"
     }
 
 
@@ -560,7 +623,18 @@ def isim_value_adayi_mi(
 
 
     # =====================================================
-    # LABEL İSE VALUE OLAMAZ
+    # CİNSİYET ALANI OLAMAZ
+    # =====================================================
+
+    if cinsiyet_degeri_mi(
+        text
+    ):
+
+        return False
+
+
+    # =====================================================
+    # LABEL OLAMAZ
     # =====================================================
 
     if label_metni_mi(
@@ -571,52 +645,7 @@ def isim_value_adayi_mi(
 
 
     # =====================================================
-    # EK YASAKLI KELİMELER
-    # =====================================================
-
-    yasaklar = [
-        "ADI",
-        "GIVEN",
-        "NAME",
-
-        "SOYADI",
-        "SURNAME",
-
-        "TC",
-        "KIMLIK",
-        "IDENTITY",
-        "TR",
-
-        "DATE",
-        "BIRTH",
-
-        "GENDER",
-        "CINSIYET",
-
-        "DOCUMENT",
-        "SERI",
-
-        "NATIONALITY",
-        "UYRUGU",
-
-        "VALID",
-        "GECERLILIK",
-
-        "SIGNATURE",
-        "IMZASI"
-    ]
-
-
-    if any(
-        kelime in norm
-        for kelime in yasaklar
-    ):
-
-        return False
-
-
-    # =====================================================
-    # SAYI / SEMBOL
+    # SAYI / SEMBOL OLAMAZ
     # =====================================================
 
     if re.fullmatch(
@@ -628,7 +657,7 @@ def isim_value_adayi_mi(
 
 
     # =====================================================
-    # RAKAM İÇERİYORSA ALMA
+    # RAKAM OLMASIN
     # =====================================================
 
     if any(
@@ -640,7 +669,7 @@ def isim_value_adayi_mi(
 
 
     # =====================================================
-    # HARF SAYISI
+    # TEMİZ İSİM
     # =====================================================
 
     temiz = isim_temizle(
@@ -661,7 +690,7 @@ def isim_value_adayi_mi(
 
 
     # =====================================================
-    # BÜYÜK HARF ORANI
+    # GERÇEK AD/SOYAD BÜYÜK HARFLİ
     # =====================================================
 
     oran = buyuk_harf_orani(
@@ -675,7 +704,7 @@ def isim_value_adayi_mi(
 
 
     # =====================================================
-    # VALUE FONTU LABEL'DAN BARİZ KÜÇÜK OLMASIN
+    # VALUE LABEL'DAN AŞIRI KÜÇÜK OLMASIN
     # =====================================================
 
     if label_item is not None:
@@ -711,7 +740,7 @@ def label_degerini_bul(
     ocr_sonuclari,
     label_item,
     sonraki_label=None,
-    maksimum_dikey=130,
+    maksimum_dikey=140,
     maksimum_yatay=220
 ):
 
@@ -721,6 +750,21 @@ def label_degerini_bul(
 
 
     adaylar = []
+
+
+    label_merkez_x = (
+        kutu_merkez_x(
+            label_item
+        )
+    )
+
+
+    label_w = max(
+        1,
+        kutu_genisligi(
+            label_item
+        )
+    )
 
 
     for item in ocr_sonuclari:
@@ -738,9 +782,9 @@ def label_degerini_bul(
             continue
 
 
-        # -------------------------------------------------
+        # =================================================
         # LABEL'IN ALTINDA OLMALI
-        # -------------------------------------------------
+        # =================================================
 
         dikey_fark = (
             item["y1"]
@@ -758,9 +802,9 @@ def label_degerini_bul(
             continue
 
 
-        # -------------------------------------------------
-        # SOYAD, AD LABEL'IN ALTINA GEÇMESİN
-        # -------------------------------------------------
+        # =================================================
+        # SOYAD VALUE AD LABEL'IN ALTINA GEÇMESİN
+        # =================================================
 
         if (
             sonraki_label is not None
@@ -773,9 +817,9 @@ def label_degerini_bul(
             continue
 
 
-        # -------------------------------------------------
-        # AYNI SÜTUN
-        # -------------------------------------------------
+        # =================================================
+        # AYNI SÜTUN KONTROLÜ
+        # =================================================
 
         yatay_fark = abs(
             item["x1"]
@@ -789,9 +833,65 @@ def label_degerini_bul(
             continue
 
 
+        # =================================================
+        # YENİ KORUMA:
+        #
+        # KUTUNUN MERKEZİ LABEL'DAN
+        # AŞIRI SAĞA/SOLA KAÇAMAZ.
+        #
+        # Böylece K/F gibi sağ sütundaki değer seçilemez.
+        # =================================================
+
+        item_merkez_x = (
+            kutu_merkez_x(
+                item
+            )
+        )
+
+
+        merkez_farki = abs(
+            item_merkez_x
+            -
+            label_merkez_x
+        )
+
+
+        izinli_merkez_farki = max(
+            120,
+            label_w * 0.85
+        )
+
+
+        if (
+            merkez_farki
+            >
+            izinli_merkez_farki
+        ):
+
+            continue
+
+
+        # =================================================
+        # VALUE'NUN SOL KENARI LABEL'DAN AŞIRI UZAK OLAMAZ
+        # =================================================
+
+        if (
+            item["x1"]
+            >
+            label_item["x2"] + 90
+        ):
+
+            continue
+
+
+        # =================================================
+        # SCORE
+        # =================================================
+
         value_h = kutu_yuksekligi(
             item
         )
+
 
         label_h = max(
             1,
@@ -808,10 +908,6 @@ def label_degerini_bul(
         )
 
 
-        # =================================================
-        # SCORE
-        # =================================================
-
         skor = 0.0
 
 
@@ -826,11 +922,19 @@ def label_degerini_bul(
         )
 
 
-        # Yatay hizalama
+        # Sol hizalama
         skor -= (
             yatay_fark
             *
             0.20
+        )
+
+
+        # Merkez hizalama
+        skor -= (
+            merkez_farki
+            *
+            0.12
         )
 
 
@@ -844,7 +948,7 @@ def label_degerini_bul(
         )
 
 
-        # Daha büyük font bonusu
+        # Font bonusu
         skor += (
             min(
                 boyut_orani,
@@ -855,7 +959,7 @@ def label_degerini_bul(
         )
 
 
-        # Confidence yardımcı kriter
+        # OCR confidence
         skor += (
             item["conf"]
             *
@@ -869,13 +973,13 @@ def label_degerini_bul(
             <=
             dikey_fark
             <=
-            60
+            65
         ):
 
-            skor += 35
+            skor += 40
 
 
-        # Sol hizası yakınsa bonus
+        # Sol hizası yakın
         if yatay_fark <= 70:
 
             skor += 20
@@ -938,7 +1042,7 @@ def fallback_ad_soyad_bul(
 
     for item in ocr_sonuclari[
         tc_index + 1:
-        tc_index + 14
+        tc_index + 16
     ]:
 
         if not isim_value_adayi_mi(
@@ -954,11 +1058,12 @@ def fallback_ad_soyad_bul(
             continue
 
 
-        # =================================================
-        # TC SATIRINA ÇOK YAKIN METİNLER İSİM OLAMAZ
-        # =================================================
-
-        if item["y1"] <= tc_item["y2"] + 20:
+        # TC satırından yeterince aşağıda olsun
+        if (
+            item["y1"]
+            <=
+            tc_item["y2"] + 20
+        ):
 
             continue
 
@@ -1030,7 +1135,7 @@ def ayni_item_mi(
 
 
 # =========================================================
-# TÜRKÇE HARF İÇİN HAFİF GENİŞLET
+# TÜRKÇE HARF İÇİN HAFİF GENİŞLETME
 # =========================================================
 
 def isim_kutusunu_hafif_genislet(
@@ -1048,8 +1153,9 @@ def isim_kutusunu_hafif_genislet(
     )
 
 
-    # Sadece birkaç piksel.
-    # Kutu seçimine etkisi YOK.
+    # Kutu seçimine karışmıyor.
+    # Sadece second-pass crop'u biraz büyüyor.
+
     ust = 5
     alt = 3
 
@@ -1093,7 +1199,7 @@ def isim_kutusunu_hafif_genislet(
 
 
 # =========================================================
-# TÜRKÇE KARAKTER SECOND PASS
+# TÜRKÇE HARF SECOND PASS
 # =========================================================
 
 def turkce_harf_iyilestir(
@@ -1190,7 +1296,7 @@ def turkce_harf_iyilestir(
             continue
 
 
-        # İkinci OCR bambaşka kelime üretemez.
+        # Bambaşka kelime üretmesine izin verme
         if (
             normalize_text(
                 ikinci_text
@@ -1279,7 +1385,9 @@ def debug_resmi_olustur(
     ad_item
 ):
 
-    debug = kart.copy()
+    debug = (
+        kart.copy()
+    )
 
 
     # =====================================================
@@ -1566,14 +1674,7 @@ def bilgileri_cimbizla(
         h * 0.15
     )
 
-    # =====================================================
-    # ÖNEMLİ DEĞİŞİKLİK
-    #
-    # 0.62 yerine 0.70
-    #
-    # HALİME gibi aşağıda kalan adlar crop dışında kalmasın.
-    # =====================================================
-
+    # HALİME gibi aşağıda kalan değerleri de gör.
     y2 = int(
         h * 0.70
     )
@@ -1588,7 +1689,7 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 2. EASYOCR
+    # 2. OCR
     # =====================================================
 
     (
@@ -1615,7 +1716,7 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 4. LABEL'LARI BUL
+    # 4. LABEL'LAR
     # =====================================================
 
     soyad_label = (
@@ -1641,7 +1742,7 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 5. LABEL ALTINDAKİ BÜYÜK HARFLİ VALUE
+    # 5. SOYAD VALUE
     # =====================================================
 
     soyad_item = (
@@ -1660,6 +1761,10 @@ def bilgileri_cimbizla(
     )
 
 
+    # =====================================================
+    # 6. AD VALUE
+    # =====================================================
+
     ad_item = (
         label_degerini_bul(
             ocr_sonuclari,
@@ -1675,7 +1780,7 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 6. FALLBACK
+    # 7. FALLBACK
     # =====================================================
 
     if (
@@ -1708,7 +1813,34 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 7. AYNI KUTU OLMASIN
+    # 8. SON GÜVENLİK:
+    # CİNSİYET ALANI YİNE DE SIZDIYSA AT
+    # =====================================================
+
+    if (
+        ad_item is not None
+        and
+        cinsiyet_degeri_mi(
+            ad_item["text"]
+        )
+    ):
+
+        ad_item = None
+
+
+    if (
+        soyad_item is not None
+        and
+        cinsiyet_degeri_mi(
+            soyad_item["text"]
+        )
+    ):
+
+        soyad_item = None
+
+
+    # =====================================================
+    # 9. AYNI KUTU OLMASIN
     # =====================================================
 
     if ayni_item_mi(
@@ -1721,7 +1853,7 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 8. TÜRKÇE HARF İYİLEŞTİRME
+    # 10. TÜRKÇE HARF SECOND PASS
     # =====================================================
 
     (
@@ -1753,7 +1885,7 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 9. GÜVEN
+    # 11. GÜVEN
     # =====================================================
 
     bulunan = sum([
@@ -1789,7 +1921,7 @@ def bilgileri_cimbizla(
 
 
     # =====================================================
-    # 10. DEBUG
+    # 12. DEBUG
     # =====================================================
 
     debug_resmi = None
