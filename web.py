@@ -1,11 +1,11 @@
 import streamlit as st
 import cv2
 import numpy as np
-import os
 import pymupdf
 import pandas as pd
 
 from io import BytesIO
+
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
 
@@ -14,17 +14,13 @@ from metin_ayiklama import bilgileri_cimbizla
 
 
 # =========================================================
-# DOSYA
+# PDF
 # =========================================================
 
-# PDF sayfalarını 200 DPI render ediyoruz.
 PDF_RENDER_DPI = 200
 
 
 def _pixmap_to_bgr(pix):
-    """
-    PyMuPDF pixmap -> OpenCV BGR görüntü.
-    """
 
     img = np.frombuffer(
         pix.samples,
@@ -36,18 +32,21 @@ def _pixmap_to_bgr(pix):
     )
 
     if pix.n == 4:
+
         return cv2.cvtColor(
             img,
             cv2.COLOR_RGBA2BGR
         )
 
     if pix.n == 3:
+
         return cv2.cvtColor(
             img,
             cv2.COLOR_RGB2BGR
         )
 
     if pix.n == 1:
+
         return cv2.cvtColor(
             img,
             cv2.COLOR_GRAY2BGR
@@ -56,23 +55,15 @@ def _pixmap_to_bgr(pix):
     return img
 
 
-def _yuklenen_dosyayi_goruntulere_ayir(dosya):
-    """
-    Bir yüklemeyi:
-        - görsel
-        - PDF
-
-    işlenebilir OpenCV görüntülerine dönüştürür.
-    """
+def _yuklenen_dosyayi_goruntulere_ayir(
+    dosya
+):
 
     ad_lower = dosya.name.lower()
 
-
-    # =====================================================
-    # PDF
-    # =====================================================
-
-    if ad_lower.endswith(".pdf"):
+    if ad_lower.endswith(
+        ".pdf"
+    ):
 
         sonuc = []
 
@@ -83,7 +74,6 @@ def _yuklenen_dosyayi_goruntulere_ayir(dosya):
             filetype="pdf"
         )
 
-
         for sayfa_no, sayfa in enumerate(
             doc,
             start=1
@@ -93,13 +83,15 @@ def _yuklenen_dosyayi_goruntulere_ayir(dosya):
                 dpi=PDF_RENDER_DPI
             )
 
-
             sonuc.append({
                 "dosya_adi":
                     dosya.name,
 
                 "gorunen_isim":
-                    f"{dosya.name} - Sayfa {sayfa_no}",
+                    (
+                        f"{dosya.name} "
+                        f"- Sayfa {sayfa_no}"
+                    ),
 
                 "sayfa_no":
                     sayfa_no,
@@ -113,27 +105,19 @@ def _yuklenen_dosyayi_goruntulere_ayir(dosya):
                     )
             })
 
-
         doc.close()
 
         return sonuc
-
-
-    # =====================================================
-    # NORMAL GÖRSEL
-    # =====================================================
 
     veri = np.frombuffer(
         dosya.getvalue(),
         dtype=np.uint8
     )
 
-
     resim = cv2.imdecode(
         veri,
         cv2.IMREAD_COLOR
     )
-
 
     return [{
         "dosya_adi":
@@ -163,15 +147,13 @@ st.set_page_config(
     layout="wide"
 )
 
-
 st.title(
     "🪪 Kimlik Kartı Okuyucu"
 )
 
-
 st.caption(
-    "Kimlik kartlarından T.C. Kimlik No, "
-    "Ad ve Soyad bilgilerini çıkarır."
+    "Yeni T.C. kimlik, eski nüfus cüzdanı ve "
+    "göçmen/yabancı kimlik belgelerini otomatik olarak tespit eder."
 )
 
 
@@ -182,49 +164,23 @@ st.caption(
 if "sonuc_df" not in st.session_state:
     st.session_state.sonuc_df = None
 
-
 if "excel_data" not in st.session_state:
     st.session_state.excel_data = None
-
 
 if "bulunamayanlar" not in st.session_state:
     st.session_state.bulunamayanlar = []
 
-
-# =========================================================
-# KİMLİK PDF SESSION
-# =========================================================
-
 if "kimlik_pdf_data" not in st.session_state:
     st.session_state.kimlik_pdf_data = None
-
 
 if "kimlik_pdf_sayisi" not in st.session_state:
     st.session_state.kimlik_pdf_sayisi = 0
 
-
 if "kimlik_pdf_duzeltilen" not in st.session_state:
     st.session_state.kimlik_pdf_duzeltilen = 0
 
-
 if "kimlik_pdf_orijinal" not in st.session_state:
     st.session_state.kimlik_pdf_orijinal = 0
-
-
-# =========================================================
-# REFERANS
-# =========================================================
-
-REFERANS_YOLU = "referans_kimlik.jpg"
-
-
-if not os.path.exists(
-    REFERANS_YOLU
-):
-    st.error(
-        "referans_kimlik.jpg bulunamadı."
-    )
-    st.stop()
 
 
 # =========================================================
@@ -237,44 +193,31 @@ with st.sidebar:
         "Ayarlar"
     )
 
-
-    # =====================================================
-    # YENİ:
-    # KİMLİKLERİ PDF YAP
-    # =====================================================
-
     kimlik_pdf_olustur = st.checkbox(
         "📄 Kimlikleri PDF olarak birleştir",
         value=False,
         help=(
-            "Kart tespit edilirse perspektifi düzeltilmiş "
-            "hali PDF'e eklenir. Kart tespit edilemezse "
-            "orijinal görüntü/sayfa PDF'e eklenir. "
-            "Böylece hiçbir kimlik kaybolmaz."
+            "Kart bulunursa düzeltilmiş hali, "
+            "bulunamazsa orijinal görüntü PDF'e eklenir."
         )
     )
 
-
     st.divider()
-
 
     debug_modu = st.checkbox(
         "OCR debug",
         value=False
     )
 
-
     kart_siniri_goster = st.checkbox(
         "Kart sınırını göster",
         value=False
     )
 
-
     feature_debug = st.checkbox(
         "SIFT eşleşmelerini göster",
         value=False
     )
-
 
     ham_ocr_goster = st.checkbox(
         "Ham OCR sonuçlarını göster",
@@ -291,7 +234,7 @@ debug_aktif = any([
 
 
 # =========================================================
-# DOSYA YÜKLE
+# DOSYA
 # =========================================================
 
 dosyalar = st.file_uploader(
@@ -314,14 +257,14 @@ dosyalar = st.file_uploader(
 # ÖNİZLEME
 # =========================================================
 
-def onizleme_hazirla(resim):
+def onizleme_hazirla(
+    resim
+):
 
     if resim is None:
         return None
 
-
     h, w = resim.shape[:2]
-
 
     if max(h, w) > 1000:
 
@@ -331,54 +274,37 @@ def onizleme_hazirla(resim):
             max(h, w)
         )
 
-
         resim = cv2.resize(
             resim,
             None,
-
             fx=oran,
             fy=oran,
-
             interpolation=cv2.INTER_AREA
         )
-
 
     basarili, encoded = cv2.imencode(
         ".jpg",
         resim,
-
         [
             cv2.IMWRITE_JPEG_QUALITY,
             82
         ]
     )
 
-
     if not basarili:
         return None
-
 
     return encoded.tobytes()
 
 
 # =========================================================
-# PDF'E GÖRÜNTÜ EKLE
+# PDF'E RESİM EKLE
 # =========================================================
 
 def resmi_pdfe_ekle(
     pdf_doc,
     resim
 ):
-    """
-    OpenCV görüntüsünü PDF'e tek sayfa olarak ekler.
-
-    Buraya:
-        - bulunan/düzeltilmiş kart
-        VEYA
-        - bulunamayan kartın orijinal görüntüsü
-
-    gönderilebilir.
-    """
 
     if (
         pdf_doc is None
@@ -387,40 +313,32 @@ def resmi_pdfe_ekle(
     ):
         return False
 
-
     try:
 
         h, w = resim.shape[:2]
 
-        if h <= 0 or w <= 0:
+        if (
+            h <= 0
+            or
+            w <= 0
+        ):
             return False
-
-
-        # -------------------------------------------------
-        # PDF'e eklemek için JPEG oluştur
-        # -------------------------------------------------
 
         basarili, encoded = cv2.imencode(
             ".jpg",
             resim,
-
             [
                 cv2.IMWRITE_JPEG_QUALITY,
                 92
             ]
         )
 
-
         if not basarili:
             return False
 
-
-        jpg_bytes = encoded.tobytes()
-
-
-        # -------------------------------------------------
-        # Sayfanın oranını görüntüyle aynı yap
-        # -------------------------------------------------
+        jpg_bytes = (
+            encoded.tobytes()
+        )
 
         pdf_genislik = 720.0
 
@@ -432,12 +350,10 @@ def resmi_pdfe_ekle(
             w
         )
 
-
         sayfa = pdf_doc.new_page(
             width=pdf_genislik,
             height=pdf_yukseklik
         )
-
 
         rect = pymupdf.Rect(
             0,
@@ -446,16 +362,13 @@ def resmi_pdfe_ekle(
             pdf_yukseklik
         )
 
-
         sayfa.insert_image(
             rect,
             stream=jpg_bytes,
             keep_proportion=True
         )
 
-
         return True
-
 
     except Exception:
 
@@ -473,21 +386,19 @@ def excel_olustur(
 
     buffer = BytesIO()
 
-
     df.to_excel(
         buffer,
         index=False,
         engine="openpyxl"
     )
 
-
-    buffer.seek(0)
-
+    buffer.seek(
+        0
+    )
 
     wb = load_workbook(
         buffer
     )
-
 
     ws = wb.active
 
@@ -495,33 +406,21 @@ def excel_olustur(
         "Kimlik Sonuçları"
     )
 
-
-    # =====================================================
-    # RENKLER
-    # =====================================================
-
     kirmizi = PatternFill(
         "solid",
         fgColor="FFC7CE"
     )
-
 
     sari = PatternFill(
         "solid",
         fgColor="FFF2CC"
     )
 
-
-    # =====================================================
-    # BAŞLIKLAR
-    # =====================================================
-
     for hucre in ws[1]:
 
         hucre.font = Font(
             bold=True
         )
-
 
     basliklar = {
         hucre.value:
@@ -530,41 +429,40 @@ def excel_olustur(
         for hucre in ws[1]
     }
 
+    kimlik_no_col = (
+        basliklar[
+            "Kimlik No"
+        ]
+    )
 
-    tc_col = basliklar[
-        "T.C."
-    ]
+    ad_col = (
+        basliklar[
+            "Ad"
+        ]
+    )
 
-    ad_col = basliklar[
-        "Ad"
-    ]
-
-    soyad_col = basliklar[
-        "Soyad"
-    ]
-
-
-    # =====================================================
-    # GÜVEN RENKLENDİRMESİ
-    # =====================================================
+    soyad_col = (
+        basliklar[
+            "Soyad"
+        ]
+    )
 
     for satir_no, item in enumerate(
         meta,
         start=2
     ):
 
-        # TC
+        # Kimlik No
         if not item[
-            "tc_bulundu"
+            "kimlik_no_bulundu"
         ]:
 
             ws.cell(
                 satir_no,
-                tc_col
+                kimlik_no_col
             ).fill = kirmizi
 
-
-        # AD
+        # Ad
         if not item[
             "ad_bulundu"
         ]:
@@ -574,7 +472,6 @@ def excel_olustur(
                 ad_col
             ).fill = kirmizi
 
-
         elif item[
             "ad_conf"
         ] < 0.50:
@@ -583,7 +480,6 @@ def excel_olustur(
                 satir_no,
                 ad_col
             ).fill = kirmizi
-
 
         elif item[
             "ad_conf"
@@ -594,8 +490,7 @@ def excel_olustur(
                 ad_col
             ).fill = sari
 
-
-        # SOYAD
+        # Soyad
         if not item[
             "soyad_bulundu"
         ]:
@@ -605,7 +500,6 @@ def excel_olustur(
                 soyad_col
             ).fill = kirmizi
 
-
         elif item[
             "soyad_conf"
         ] < 0.50:
@@ -614,7 +508,6 @@ def excel_olustur(
                 satir_no,
                 soyad_col
             ).fill = kirmizi
-
 
         elif item[
             "soyad_conf"
@@ -625,36 +518,56 @@ def excel_olustur(
                 soyad_col
             ).fill = sari
 
+        # =================================================
+        # SÜRESİ GEÇMİŞ GÖÇMEN BELGESİ
+        # TÜM SATIR SARI
+        # =================================================
 
-    # =====================================================
-    # SÜTUN GENİŞLİKLERİ
-    # =====================================================
+        if item.get(
+            "belge_gecerli"
+        ) is False:
 
-    for col, width in zip(
-        "ABCD",
-        (
-            12,
-            18,
-            25,
-            25
-        )
-    ):
+            for sutun_no in range(
+                1,
+                ws.max_column + 1
+            ):
+
+                hucre = ws.cell(
+                    satir_no,
+                    sutun_no
+                )
+
+                hucre.fill = sari
+
+                hucre.font = Font(
+                    bold=True
+                )
+
+    genislikler = {
+        "A": 12,
+        "B": 20,
+        "C": 20,
+        "D": 25,
+        "E": 25,
+        "F": 18,
+        "G": 18,
+    }
+
+    for col, width in genislikler.items():
 
         ws.column_dimensions[
             col
         ].width = width
 
-
     sonuc = BytesIO()
-
 
     wb.save(
         sonuc
     )
 
-
-    sonuc.seek(0)
-
+    sonuc.seek(
+        0
+    )
 
     return sonuc.getvalue()
 
@@ -672,45 +585,26 @@ if (
     )
 ):
 
-    # =====================================================
-    # ESKİ SONUÇLARI TEMİZLE
-    # =====================================================
-
     st.session_state.sonuc_df = None
-
     st.session_state.excel_data = None
-
     st.session_state.bulunamayanlar = []
 
     st.session_state.kimlik_pdf_data = None
-
     st.session_state.kimlik_pdf_sayisi = 0
-
     st.session_state.kimlik_pdf_duzeltilen = 0
-
     st.session_state.kimlik_pdf_orijinal = 0
 
-
     durum = st.empty()
-
 
     durum.write(
         "Dosyalar hazırlanıyor..."
     )
 
-
-    # =====================================================
-    # PDF BELGESİNİ HAZIRLA
-    # =====================================================
-
     kimlik_pdf_doc = None
 
     pdf_toplam = 0
-
     pdf_duzeltilen = 0
-
     pdf_orijinal = 0
-
 
     if kimlik_pdf_olustur:
 
@@ -718,13 +612,7 @@ if (
             pymupdf.open()
         )
 
-
-    # =====================================================
-    # DOSYALARI HAZIRLA
-    # =====================================================
-
     islenecekler = []
-
 
     for dosya in dosyalar:
 
@@ -734,22 +622,13 @@ if (
             )
         )
 
-
-    # =====================================================
-    # SONUÇ LİSTELERİ
-    # =====================================================
-
     tum_sonuclar = []
-
     meta = []
-
     bulunamayanlar = []
-
 
     toplam = len(
         islenecekler
     )
-
 
     if toplam == 0:
 
@@ -759,29 +638,35 @@ if (
 
         st.stop()
 
-
     progress = st.progress(
         0
     )
 
-
     # =====================================================
-    # HER SAYFA / GÖRSEL
+    # HER SAYFA
     # =====================================================
 
     for index, bilgi in enumerate(
         islenecekler
     ):
 
-        sayfa_no = bilgi[
-            "sayfa_no"
-        ]
+        sayfa_no = (
+            bilgi[
+                "sayfa_no"
+            ]
+        )
 
+        pdf_mi = (
+            bilgi[
+                "pdf_mi"
+            ]
+        )
 
-        pdf_mi = bilgi[
-            "pdf_mi"
-        ]
-
+        resim = (
+            bilgi[
+                "resim"
+            ]
+        )
 
         durum.write(
             (
@@ -790,13 +675,7 @@ if (
             )
         )
 
-
-        resim = bilgi[
-            "resim"
-        ]
-
-
-        tc_no = (
+        kimlik_no = (
             "Bulunamadi"
         )
 
@@ -808,21 +687,23 @@ if (
             "Bulunamadi"
         )
 
-
         ad_conf = 0.0
-
         soyad_conf = 0.0
 
+        belge_tipi = (
+            "bilinmiyor"
+        )
+
+        bitis_tarihi = ""
+
+        belge_gecerli = None
 
         kart = None
-
         kart_sonuc = {}
-
         ocr_sonuc = {}
 
-
         # =================================================
-        # 1. KART TESPİT
+        # KART + BELGE TİPİ
         # =================================================
 
         if resim is not None:
@@ -832,7 +713,6 @@ if (
                 kart_sonuc = (
                     kart_tespit_et_ve_duzelt(
                         resim,
-                        REFERANS_YOLU,
 
                         debug_match=(
                             feature_debug
@@ -844,37 +724,32 @@ if (
                     )
                 )
 
-
-            except Exception:
+            except Exception as e:
 
                 kart_sonuc = {
                     "basarili":
-                        False
-                }
+                        False,
 
+                    "mesaj":
+                        str(e)
+                }
 
             if kart_sonuc.get(
                 "basarili",
                 False
             ):
 
-                kart = (
-                    kart_sonuc.get(
-                        "kart"
-                    )
+                kart = kart_sonuc.get(
+                    "kart"
                 )
 
+                belge_tipi = kart_sonuc.get(
+                    "belge_tipi",
+                    "tc"
+                )
 
         # =================================================
-        # 2. KİMLİK PDF'E EKLE
-        #
-        # KART BULUNURSA:
-        #     düzeltmiş kart
-        #
-        # KART BULUNAMAZSA:
-        #     orijinal sayfa/görüntü
-        #
-        # Böylece hiçbir yükleme kaybolmaz.
+        # KİMLİK PDF
         # =================================================
 
         if kimlik_pdf_olustur:
@@ -882,48 +757,37 @@ if (
             if kart is not None:
 
                 pdf_resmi = kart
-
                 duzeltilmis_mi = True
 
             else:
 
                 pdf_resmi = resim
-
                 duzeltilmis_mi = False
-
 
             if pdf_resmi is not None:
 
-                basarili = (
-                    resmi_pdfe_ekle(
-                        kimlik_pdf_doc,
-                        pdf_resmi
-                    )
+                basarili = resmi_pdfe_ekle(
+                    kimlik_pdf_doc,
+                    pdf_resmi
                 )
-
 
                 if basarili:
 
                     pdf_toplam += 1
 
-
                     if duzeltilmis_mi:
-
                         pdf_duzeltilen += 1
 
                     else:
-
                         pdf_orijinal += 1
 
-
         # =================================================
-        # 3. OCR
+        # OCR
         # =================================================
 
         sonuc_sayfa_no = (
             sayfa_no
         )
-
 
         if kart is not None:
 
@@ -941,15 +805,20 @@ if (
                             debug_modu
                             or
                             ham_ocr_goster
+                        ),
+
+                        belge_tipi=(
+                            belge_tipi
                         )
                     )
                 )
 
+            except Exception as e:
 
-            except Exception:
-
-                ocr_sonuc = {}
-
+                ocr_sonuc = {
+                    "hata":
+                        str(e)
+                }
 
             sonuc_sayfa_no = (
                 ocr_sonuc.get(
@@ -958,14 +827,12 @@ if (
                 )
             )
 
-
-            tc_no = (
+            kimlik_no = (
                 ocr_sonuc.get(
                     "tc_no",
                     "Bulunamadi"
                 )
             )
-
 
             ad = (
                 ocr_sonuc.get(
@@ -974,14 +841,12 @@ if (
                 )
             )
 
-
             soyad = (
                 ocr_sonuc.get(
                     "soyad",
                     "Bulunamadi"
                 )
             )
-
 
             ad_conf = float(
                 ocr_sonuc.get(
@@ -990,7 +855,6 @@ if (
                 )
             )
 
-
             soyad_conf = float(
                 ocr_sonuc.get(
                     "soyad_conf",
@@ -998,9 +862,79 @@ if (
                 )
             )
 
+            bitis_tarihi = (
+                ocr_sonuc.get(
+                    "bitis_tarihi",
+                    ""
+                )
+            )
+
+            belge_gecerli = (
+                ocr_sonuc.get(
+                    "belge_gecerli"
+                )
+            )
 
         # =================================================
-        # 4. TABLO
+        # BELGE TÜRÜ ADI
+        # =================================================
+
+        if belge_tipi == "gocmen":
+
+            belge_turu_yazi = (
+                "Göçmen / Yabancı"
+            )
+
+        elif belge_tipi == "eski_tc":
+
+            belge_turu_yazi = (
+                "Eski T.C. Kimlik"
+            )
+
+        elif belge_tipi == "tc":
+
+            belge_turu_yazi = (
+                "T.C. Kimlik"
+            )
+
+        else:
+
+            belge_turu_yazi = (
+                "Bilinmiyor"
+            )
+
+        # =================================================
+        # GEÇERLİLİK
+        # =================================================
+
+        if belge_tipi == "gocmen":
+
+            if belge_gecerli is False:
+
+                gecerlilik_yazi = (
+                    "GEÇERSİZ"
+                )
+
+            elif belge_gecerli is True:
+
+                gecerlilik_yazi = (
+                    "Geçerli"
+                )
+
+            else:
+
+                gecerlilik_yazi = (
+                    "Kontrol Edilemedi"
+                )
+
+        else:
+
+            gecerlilik_yazi = "-"
+
+            bitis_tarihi = "-"
+
+        # =================================================
+        # TABLO
         # =================================================
 
         tablo_sayfa = (
@@ -1009,32 +943,38 @@ if (
             else "-"
         )
 
-
         tum_sonuclar.append({
             "Sayfa No":
                 tablo_sayfa,
 
-            "T.C.":
-                tc_no,
+            "Belge Türü":
+                belge_turu_yazi,
+
+            "Kimlik No":
+                kimlik_no,
 
             "Ad":
                 ad,
 
             "Soyad":
-                soyad
+                soyad,
+
+            "Bitiş Tarihi":
+                bitis_tarihi,
+
+            "Geçerlilik":
+                gecerlilik_yazi
         })
 
-
         # =================================================
-        # 5. META
+        # META
         # =================================================
 
-        tc_bulundu = (
-            tc_no
+        kimlik_no_bulundu = (
+            kimlik_no
             !=
             "Bulunamadi"
         )
-
 
         ad_bulundu = (
             ad
@@ -1042,17 +982,15 @@ if (
             "Bulunamadi"
         )
 
-
         soyad_bulundu = (
             soyad
             !=
             "Bulunamadi"
         )
 
-
         meta.append({
-            "tc_bulundu":
-                tc_bulundu,
+            "kimlik_no_bulundu":
+                kimlik_no_bulundu,
 
             "ad_bulundu":
                 ad_bulundu,
@@ -1064,12 +1002,17 @@ if (
                 ad_conf,
 
             "soyad_conf":
-                soyad_conf
+                soyad_conf,
+
+            "belge_gecerli":
+                belge_gecerli,
+
+            "belge_tipi":
+                belge_tipi
         })
 
-
         # =================================================
-        # 6. BULUNAMAYANLAR
+        # BULUNAMAYANLAR
         # =================================================
 
         eksikler = [
@@ -1078,8 +1021,8 @@ if (
             for etiket, bulundu
             in [
                 (
-                    "T.C.",
-                    tc_bulundu
+                    "Kimlik No",
+                    kimlik_no_bulundu
                 ),
 
                 (
@@ -1095,7 +1038,6 @@ if (
 
             if not bulundu
         ]
-
 
         if eksikler:
 
@@ -1124,15 +1066,13 @@ if (
                     )
             })
 
-
         # =================================================
-        # 7. DEBUG
+        # DEBUG
         # =================================================
 
         if debug_aktif:
 
             st.divider()
-
 
             if pdf_mi:
 
@@ -1146,9 +1086,12 @@ if (
                     f"### {bilgi['dosya_adi']}"
                 )
 
+            st.write(
+                f"Belge tipi: **{belge_turu_yazi}**"
+            )
 
             st.write(
-                f"T.C.: {tc_no}"
+                f"Kimlik No: {kimlik_no}"
             )
 
             st.write(
@@ -1159,8 +1102,24 @@ if (
                 f"Soyad: {soyad}"
             )
 
+            if belge_tipi == "gocmen":
 
-            # OCR kutuları
+                st.write(
+                    f"Bitiş tarihi: {bitis_tarihi}"
+                )
+
+                if belge_gecerli is False:
+
+                    st.warning(
+                        "⚠️ Bu belgenin geçerlilik süresi geçmiş."
+                    )
+
+                elif belge_gecerli is True:
+
+                    st.success(
+                        "✅ Belge geçerli."
+                    )
+
             if (
                 debug_modu
                 and
@@ -1179,8 +1138,6 @@ if (
                     )
                 )
 
-
-            # Kart sınırı
             if (
                 kart_siniri_goster
                 and
@@ -1199,8 +1156,6 @@ if (
                     )
                 )
 
-
-            # SIFT eşleşmeleri
             if (
                 feature_debug
                 and
@@ -1219,8 +1174,6 @@ if (
                     )
                 )
 
-
-            # Ham OCR
             if ham_ocr_goster:
 
                 with st.expander(
@@ -1234,13 +1187,11 @@ if (
                         )
                     )
 
-
                     if not ham_sonuclar:
 
                         st.info(
                             "OCR sonucu yok."
                         )
-
 
                     for item in ham_sonuclar:
 
@@ -1251,20 +1202,14 @@ if (
                             )
                         )
 
-
-        # =================================================
-        # 8. PROGRESS
-        # =================================================
-
         progress.progress(
             (index + 1)
             /
             toplam
         )
 
-
     # =====================================================
-    # KİMLİK PDF'İ TAMAMLA
+    # PDF TAMAMLA
     # =====================================================
 
     if kimlik_pdf_doc is not None:
@@ -1280,36 +1225,27 @@ if (
                     )
                 )
 
-
                 st.session_state.kimlik_pdf_data = (
                     pdf_bytes
                 )
-
 
                 st.session_state.kimlik_pdf_sayisi = (
                     pdf_toplam
                 )
 
-
                 st.session_state.kimlik_pdf_duzeltilen = (
                     pdf_duzeltilen
                 )
-
 
                 st.session_state.kimlik_pdf_orijinal = (
                     pdf_orijinal
                 )
 
-
             except Exception:
 
-                st.session_state.kimlik_pdf_data = (
-                    None
-                )
-
+                st.session_state.kimlik_pdf_data = None
 
         kimlik_pdf_doc.close()
-
 
     # =====================================================
     # SONUÇ
@@ -1319,23 +1255,23 @@ if (
         f"✅ {toplam} sayfa işlendi."
     )
 
-
     df = pd.DataFrame(
         tum_sonuclar,
 
         columns=[
             "Sayfa No",
-            "T.C.",
+            "Belge Türü",
+            "Kimlik No",
             "Ad",
-            "Soyad"
+            "Soyad",
+            "Bitiş Tarihi",
+            "Geçerlilik"
         ]
     )
-
 
     st.session_state.sonuc_df = (
         df
     )
-
 
     st.session_state.excel_data = (
         excel_olustur(
@@ -1343,7 +1279,6 @@ if (
             meta
         )
     )
-
 
     st.session_state.bulunamayanlar = (
         bulunamayanlar
@@ -1361,11 +1296,9 @@ if (
 
     st.divider()
 
-
     st.header(
         "📋 Sonuçlar"
     )
-
 
     st.dataframe(
         st.session_state.sonuc_df,
@@ -1375,9 +1308,8 @@ if (
         hide_index=True
     )
 
-
     # =====================================================
-    # İNDİRME BUTONLARI
+    # DOWNLOAD
     # =====================================================
 
     if (
@@ -1388,11 +1320,6 @@ if (
         col1, col2 = st.columns(
             2
         )
-
-
-        # -------------------------------------------------
-        # Excel
-        # -------------------------------------------------
 
         with col1:
 
@@ -1416,11 +1343,6 @@ if (
                 use_container_width=True
             )
 
-
-        # -------------------------------------------------
-        # Kimlik PDF
-        # -------------------------------------------------
-
         with col2:
 
             st.download_button(
@@ -1442,26 +1364,19 @@ if (
                 use_container_width=True
             )
 
-
-        # -------------------------------------------------
-        # PDF özeti
-        # -------------------------------------------------
-
         st.caption(
             (
                 f"PDF: "
                 f"{st.session_state.kimlik_pdf_duzeltilen} "
-                f"kimlik düzeltilmiş, "
+                f"belge düzeltilmiş, "
                 f"{st.session_state.kimlik_pdf_orijinal} "
-                f"kimlik/sayfa tespit edilemediği için "
+                f"belge tespit edilemediği için "
                 f"orijinal haliyle eklendi."
             )
         )
 
-
     else:
 
-        # Yalnızca Excel
         st.download_button(
             "📥 Excel indir",
 
@@ -1480,15 +1395,13 @@ if (
             )
         )
 
-
     # =====================================================
-    # BULUNAMAYAN KİMLİKLER
+    # BULUNAMAYANLAR
     # =====================================================
 
     bulunamayanlar = (
         st.session_state.bulunamayanlar
     )
-
 
     if bulunamayanlar:
 
@@ -1505,7 +1418,6 @@ if (
                     "---"
                 )
 
-
                 if item[
                     "pdf_mi"
                 ]:
@@ -1518,7 +1430,6 @@ if (
                         )
                     )
 
-
                 else:
 
                     st.subheader(
@@ -1528,14 +1439,12 @@ if (
                         )
                     )
 
-
                 st.write(
                     (
                         "**Bulunamayan alanlar:** "
                         f'{item["eksik"]}'
                     )
                 )
-
 
                 if item[
                     "resim"
