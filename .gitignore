@@ -18,3 +18,5 @@ Thumbs.db
 *.png
 *.pdf
 !referans_kimlik.jpg
+!referans_eski_tc.jpg
+!referans_gocmen.jpg
