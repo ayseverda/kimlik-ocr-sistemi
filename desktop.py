@@ -259,7 +259,7 @@ def dosyayi_sistemde_ac(yol):
 class Worker(QThread):
     progress = Signal(int, int, str)
     row_ready = Signal(dict)
-    finished_ok = Signal(list, object)
+    finished_ok = Signal(list, object, bool)
     failed = Signal(str)
 
     def __init__(self, dosyalar, pdf_olustur=False, debug=False):
@@ -267,6 +267,15 @@ class Worker(QThread):
         self.dosyalar = dosyalar
         self.pdf_olustur = pdf_olustur
         self.debug = debug
+        self._durduruldu = False
+
+    def durdur(self):
+        """Dışarıdan (ana thread'den) çağrılır. Basit bir bool bayrak —
+        Python'da GIL sayesinde tek bir attribute yazımı thread-safe kabul
+        edilir, ekstra kilide gerek yok. run() döngüsü bunu her sayfa
+        aralığında kontrol eder; şu an işlenmekte olan sayfa yarıda
+        kesilmez, bir SONRAKİ sayfaya geçmeden döngü sonlanır."""
+        self._durduruldu = True
 
     def run(self):
         try:
@@ -288,7 +297,11 @@ class Worker(QThread):
             sayac = 0
 
             for yol in self.dosyalar:
+                if self._durduruldu:
+                    break
                 for sayfa_no, resim, girdi_hatasi in dosyayi_goruntulere_ayir(yol):
+                    if self._durduruldu:
+                        break
                     sayac += 1
                     self.progress.emit(sayac, toplam, f"{os.path.basename(yol)} işleniyor")
 
@@ -434,7 +447,7 @@ class Worker(QThread):
                     pdf_bytes = pdf_doc.tobytes(garbage=3, deflate=True)
                 pdf_doc.close()
 
-            self.finished_ok.emit(sonuclar, pdf_bytes)
+            self.finished_ok.emit(sonuclar, pdf_bytes, self._durduruldu)
         except Exception as e:
             self.failed.emit(repr(e))
 
@@ -616,6 +629,14 @@ class MainWindow(QMainWindow):
         self.baslat_btn = QPushButton("İşlemi Başlat")
         self.baslat_btn.setEnabled(False)
 
+        self.durdur_btn = QPushButton("⏹ Durdur")
+        self.durdur_btn.setEnabled(False)
+        self.durdur_btn.setStyleSheet(
+            "QPushButton { background-color: #4a2020; border-color: #7a3030; }"
+            "QPushButton:hover { background-color: #5a2828; }"
+            "QPushButton:disabled { color: #777d86; background-color: #222529; border-color: #34383e; }"
+        )
+
         self.edit_btn = QPushButton("Düzenle")
         self.edit_btn.setCheckable(True)
         self.edit_btn.setEnabled(False)
@@ -627,6 +648,7 @@ class MainWindow(QMainWindow):
             self.sec_btn,
             self.klasor_btn,
             self.baslat_btn,
+            self.durdur_btn,
             self.edit_btn,
         ):
             btn.setMinimumHeight(42)
@@ -634,6 +656,7 @@ class MainWindow(QMainWindow):
         ust.addWidget(self.sec_btn)
         ust.addWidget(self.klasor_btn)
         ust.addWidget(self.baslat_btn)
+        ust.addWidget(self.durdur_btn)
         ust.addWidget(self.edit_btn)
         ust.addStretch(1)
         ust.addWidget(self.pdf_cb)
@@ -742,6 +765,7 @@ class MainWindow(QMainWindow):
         self.sec_btn.clicked.connect(self.dosya_sec)
         self.klasor_btn.clicked.connect(self.klasor_sec)
         self.baslat_btn.clicked.connect(self.baslat)
+        self.durdur_btn.clicked.connect(self.durdur)
         self.edit_btn.toggled.connect(self.duzenleme_modu_degisti)
         self.debug_cb.toggled.connect(self.debug_gorunumu_degisti)
         self.table.itemSelectionChanged.connect(self.onizleme_goster)
@@ -784,6 +808,7 @@ class MainWindow(QMainWindow):
         self.edit_btn.setChecked(False)
         self.edit_btn.setEnabled(False)
         self.baslat_btn.setEnabled(False)
+        self.durdur_btn.setEnabled(True)
         self.progress.setValue(0)
         self.debug_text.clear()
 
@@ -793,6 +818,18 @@ class MainWindow(QMainWindow):
         self.worker.finished_ok.connect(self.bitti)
         self.worker.failed.connect(self.hata)
         self.worker.start()
+
+    def durdur(self):
+        """İşlemi ANINDA kesmez — Worker, o an işlemekte olduğu sayfayı
+        bitirir, bir SONRAKİ sayfaya geçmeden döngüden çıkar. O ana kadar
+        tamamlanmış olan satırlar tabloda zaten görünüyor (row_ready ile
+        canlı ekleniyordu) ve finished_ok ile de kalıcı sonuç listesine
+        (Excel/PDF için kullanılan self.sonuclar) yazılır — hiçbir şey
+        kaybolmaz, sadece kalan sayfalar işlenmez."""
+        if self.worker is not None:
+            self.worker.durdur()
+            self.durdur_btn.setEnabled(False)
+            self.bilgi.setText("Durduruluyor... mevcut sayfa tamamlanınca işlem sonlanacak.")
 
     def progress_guncelle(self, n, toplam, mesaj):
         self.progress.setMaximum(max(1, toplam))
@@ -905,19 +942,24 @@ class MainWindow(QMainWindow):
         if self.table.currentRow() == row:
             self.onizleme_goster()
 
-    def bitti(self, sonuclar, pdf_bytes):
+    def bitti(self, sonuclar, pdf_bytes, durduruldu=False):
         self.sonuclar = sonuclar
         self.pdf_bytes = pdf_bytes
         self.baslat_btn.setEnabled(True)
+        self.durdur_btn.setEnabled(False)
         self.excel_btn.setEnabled(bool(sonuclar))
         self.pdf_btn.setEnabled(bool(pdf_bytes))
         self.edit_btn.setEnabled(bool(sonuclar))
-        self.bilgi.setText(f"Tamamlandı — {len(sonuclar)} kimlik/sayfa işlendi.")
+        if durduruldu:
+            self.bilgi.setText(f"⏹ Durduruldu — {len(sonuclar)} kimlik/sayfa işlendi (kalanlar işlenmedi).")
+        else:
+            self.bilgi.setText(f"Tamamlandı — {len(sonuclar)} kimlik/sayfa işlendi.")
         if self.table.rowCount():
             self.table.selectRow(0)
 
     def hata(self, mesaj):
         self.baslat_btn.setEnabled(True)
+        self.durdur_btn.setEnabled(False)
         QMessageBox.critical(self, "Hata", mesaj)
 
     def onizleme_goster(self):
