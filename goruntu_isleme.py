@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import os
+import sys
 import time
 
 
@@ -11,7 +12,19 @@ import time
 MAX_CALISMA_BOYUTU = 1300
 SIFT_AZAMI_OZELLIK = 3200
 
-MODUL_DIZINI = os.path.dirname(os.path.abspath(__file__))
+def _modul_dizini_bul():
+    """PyInstaller ile .exe'ye paketlendiğinde __file__ güvenilir bir yol
+    vermeyebiliyor (donmuş modüllerde gerçek bir dosya olarak var olmaz).
+    sys.frozen + sys._MEIPASS, PyInstaller'ın resmi olarak önerdiği,
+    "gerçekten çalıştırılabilir dosyanın veri klasörü neresi" sorusunun
+    standart cevabı. Normal (donmuş olmayan) çalıştırmada eskisi gibi
+    __file__'a dayanır — davranış hiç değişmiyor."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+MODUL_DIZINI = _modul_dizini_bul()
 
 # =========================================================
 # BELGE TİPİ KONFİGÜRASYONU
