@@ -1,1 +1,0 @@
-"""OCR ayrıştırıcı regresyon testleri."""
