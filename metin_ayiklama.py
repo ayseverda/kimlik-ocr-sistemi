@@ -355,12 +355,26 @@ def _eski_soyad_label_mi(text):
     return max(benzerlik(norm, "SOYADI"), benzerlik(norm, "SOYAD")) >= 0.64
 
 
+def _icerir_etiket_kelimesi(norm, hedef):
+    """Ham 'hedef in norm' alt-dize kontrolü, gerçek OCR gürültüsünde
+    tehlikeli tesadüfler üretebiliyordu: 'AĞANAK' soyadı OCR'da 'atanak'
+    diye okununca, içinde harfiyen 'ANA' geçtiği için (A-T-ANA-K) 'ANA ADI'
+    etiketi sanılıp adaylıktan düşürülüyordu. Bu yüzden kısa/genel kelimeler
+    (ANA, BABA, DOGUM, KIMLIK, SERI...) artık sadece TAM KELİME olarak
+    eşleşiyor. 'SOY' istisna: SOYADI/SOYAD tek bir OCR token'ı olduğu için
+    kelimenin BAŞINDA olması yeterli sayılıyor."""
+    kelimeler = norm.split()
+    if hedef == "SOY":
+        return any(k.startswith("SOY") for k in kelimeler)
+    return hedef in kelimeler
+
+
 def _eski_ad_label_mi(text):
     norm = normalize_text(text)
     if not norm:
         return False
     yasaklar = ["SOY", "BABA", "ANA", "DOGUM", "KIMLIK", "SERI"]
-    if any(x in norm for x in yasaklar):
+    if any(_icerir_etiket_kelimesi(norm, x) for x in yasaklar):
         return False
     if norm in {"ADI", "AD", "AD1", "A DI", "A0I", "A01", "AOI"}:
         return True
@@ -389,7 +403,7 @@ def _eski_herhangi_bir_label_mi(text):
         "BABA", "ANA", "DOGUM", "TARIHI", "YERI", "SERI", "MEDENI",
         "CINSIYET", "KAN", "NUFUS", "CUZDANI", "TURKIYE", "CUMHURIYETI",
     ]
-    return any(x in norm for x in sabitler)
+    return any(_icerir_etiket_kelimesi(norm, x) for x in sabitler)
 
 
 def _eski_en_iyi_label_bul(ocr, tip):
@@ -423,7 +437,12 @@ def _eski_isim_value_adayi_mi(item):
         return False
     temiz = isim_temizle(text)
     harfler = re.sub(r"[^A-ZÇĞİÖŞÜ]", "", temiz)
-    return len(harfler) >= 2
+    # 2 harf çok düşük bir eşikti: TC no'nun hemen altında sık görülen 'ld',
+    # 'No', 'So' gibi okunamayan etiket kırıntıları da bu eşiği geçip gerçek
+    # satırdan ÖNCE sahte bir "değer satırı" oluşturabiliyordu (gerçek bir
+    # görselde tam bu yüzden soyad='LD' gibi anlamsız bir sonuç çıktı).
+    # Türkçe ad/soyadların neredeyse tamamı 3+ harf olduğu için bu güvenli.
+    return len(harfler) >= 3
 
 
 def _eski_ayni_satir_mi(item1, item2, minimum_tolerans=20):
@@ -432,6 +451,29 @@ def _eski_ayni_satir_mi(item1, item2, minimum_tolerans=20):
     ort_h = (yukseklik(item1) + yukseklik(item2)) / 2.0
     tolerans = max(minimum_tolerans, ort_h * 0.65)
     return abs(merkez_y(item1) - merkez_y(item2)) <= tolerans
+
+
+def _parcalari_birlestir(parcalar):
+    """Birden çok OCR kutusunu tek bir 'değer' sonucuna birleştirir (metni
+    boşlukla birleştirir, kutuyu dış sınırlarına genişletir, confidence'ı
+    ortalar). Bu birleştirme eskiden üç ayrı yerde (eski TC'nin hem etiket-
+    bazlı hem TC-altı-satır bazlı yolları, göçmenin satır-içi isim bulması)
+    birebir aynı şekilde tekrarlanıyordu — davranış aynı, tek yerden çağrılıyor."""
+    textler = [isim_temizle(item.get("text", "")) for item in parcalar]
+    textler = [t for t in textler if t]
+    if not textler:
+        return None
+    deger = " ".join(textler)
+    conf = sum(float(item.get("conf", 0.0)) for item in parcalar) / len(parcalar)
+    return {
+        "deger": deger,
+        "item": {
+            "text": deger, "conf": conf,
+            "x1": min(x["x1"] for x in parcalar), "y1": min(x["y1"] for x in parcalar),
+            "x2": max(x["x2"] for x in parcalar), "y2": max(x["y2"] for x in parcalar),
+        },
+        "items": parcalar,
+    }
 
 
 def _eski_label_satirindaki_deger_bul(ocr, label):
@@ -470,23 +512,7 @@ def _eski_label_satirindaki_deger_bul(ocr, label):
         if abs(merkez_y(item) - anchor_y) <= max(18, anchor_h * 0.55)
     ]
     ayni_deger_parcalari.sort(key=lambda x: x["x1"])
-
-    parcalar = [isim_temizle(item["text"]) for item in ayni_deger_parcalari]
-    parcalar = [p for p in parcalar if p]
-    if not parcalar:
-        return None
-
-    deger = " ".join(parcalar)
-    conf = sum(float(item.get("conf", 0.0)) for item in ayni_deger_parcalari) / len(ayni_deger_parcalari)
-    return {
-        "deger": deger,
-        "item": {
-            "text": deger, "conf": conf,
-            "x1": min(x["x1"] for x in ayni_deger_parcalari), "y1": min(x["y1"] for x in ayni_deger_parcalari),
-            "x2": max(x["x2"] for x in ayni_deger_parcalari), "y2": max(x["y2"] for x in ayni_deger_parcalari),
-        },
-        "items": ayni_deger_parcalari,
-    }
+    return _parcalari_birlestir(ayni_deger_parcalari)
 
 
 def _eski_tc_no_bul(ocr):
@@ -547,21 +573,9 @@ def _eski_tc_altindaki_deger_satirlari(ocr, tc_item):
         value_parcalari = [x for x in satir if yukseklik(x) >= max_h * 0.60]
         if not value_parcalari:
             continue
-        textler = [isim_temizle(item.get("text", "")) for item in value_parcalari]
-        textler = [t for t in textler if t]
-        if not textler:
-            continue
-        text = " ".join(textler)
-        conf = sum(float(x.get("conf", 0.0)) for x in value_parcalari) / len(value_parcalari)
-        sonuclar.append({
-            "deger": text,
-            "item": {
-                "text": text, "conf": conf,
-                "x1": min(x["x1"] for x in value_parcalari), "y1": min(x["y1"] for x in value_parcalari),
-                "x2": max(x["x2"] for x in value_parcalari), "y2": max(x["y2"] for x in value_parcalari),
-            },
-            "items": value_parcalari,
-        })
+        sonuc = _parcalari_birlestir(value_parcalari)
+        if sonuc is not None:
+            sonuclar.append(sonuc)
 
     sonuclar.sort(key=lambda x: merkez_y(x["item"]))
     return sonuclar
@@ -577,246 +591,83 @@ def _eski_kullanilan_satiri_cikar(satirlar, kullanilan_sonuc):
 
 
 def eski_tc_bilgilerini_bul(ocr):
-    """
-    Eski T.C. kimliklerde ANA KURAL:
-        TC satırından sonraki ilk gerçek değer satırı = SOYAD
-        bir sonraki farklı değer satırı = AD
-
-    Label OCR sadece doğrulama / yedek amaçlıdır.
-    Böylece SOYADI / ADI etiketinin bir satır kayık okunması,
-    SERTELLİ yerine MELEK'i veya AGANAK yerine ABDULLAH'ı
-    soyad seçmesine yol açmaz.
-    """
     tc_no, tc_item = _eski_tc_no_bul(ocr)
 
-    # -----------------------------------------------------
-    # 1) Önce TC'yi anchor yap ve fiziksel satır sırasını kullan
-    # -----------------------------------------------------
-    tum_satirlar = _eski_tc_altindaki_deger_satirlari(
-        ocr,
-        tc_item,
-    )
+    soyad_label = _eski_en_iyi_label_bul(ocr, "soyad")
+    ad_label = _eski_en_iyi_label_bul(ocr, "ad")
 
-    soyad_sonuc = (
-        tum_satirlar[0]
-        if len(tum_satirlar) >= 1
-        else None
-    )
+    soyad_sonuc = _eski_label_satirindaki_deger_bul(ocr, soyad_label)
+    ad_sonuc = _eski_label_satirindaki_deger_bul(ocr, ad_label)
 
-    ad_sonuc = (
-        tum_satirlar[1]
-        if len(tum_satirlar) >= 2
-        else None
-    )
+    if soyad_sonuc is not None and ad_sonuc is not None and _eski_ayni_satir_mi(soyad_sonuc["item"], ad_sonuc["item"]):
+        ad_sonuc = None
+    if soyad_sonuc is not None and ad_sonuc is not None and merkez_y(soyad_sonuc["item"]) >= merkez_y(ad_sonuc["item"]):
+        ad_sonuc = None
 
-    # -----------------------------------------------------
-    # 2) Label sonuçlarını yalnız eksik alanlarda yedek olarak kullan
-    # -----------------------------------------------------
-    soyad_label = _eski_en_iyi_label_bul(
-        ocr,
-        "soyad",
-    )
-    ad_label = _eski_en_iyi_label_bul(
-        ocr,
-        "ad",
-    )
+    tum_satirlar = _eski_tc_altindaki_deger_satirlari(ocr, tc_item)
+    kalan_satirlar = _eski_kullanilan_satiri_cikar(tum_satirlar, soyad_sonuc)
+    kalan_satirlar = _eski_kullanilan_satiri_cikar(kalan_satirlar, ad_sonuc)
 
     if soyad_sonuc is None:
-        label_sonuc = _eski_label_satirindaki_deger_bul(
-            ocr,
-            soyad_label,
-        )
-        if label_sonuc is not None:
-            soyad_sonuc = label_sonuc
+        if tum_satirlar:
+            soyad_sonuc = tum_satirlar[0]
+        kalan_satirlar = _eski_kullanilan_satiri_cikar(tum_satirlar, soyad_sonuc)
+        kalan_satirlar = _eski_kullanilan_satiri_cikar(kalan_satirlar, ad_sonuc)
 
     if ad_sonuc is None:
-        label_sonuc = _eski_label_satirindaki_deger_bul(
-            ocr,
-            ad_label,
+        soy_y = (
+            merkez_y(soyad_sonuc["item"]) if soyad_sonuc is not None
+            else merkez_y(tc_item) if tc_item is not None
+            else -1
         )
-        if label_sonuc is not None:
-            ad_sonuc = label_sonuc
-
-    # -----------------------------------------------------
-    # 3) Aynı satır / ters sıra / aynı metin koruması
-    # -----------------------------------------------------
-    if (
-        soyad_sonuc is not None
-        and ad_sonuc is not None
-    ):
-        if _eski_ayni_satir_mi(
-            soyad_sonuc["item"],
-            ad_sonuc["item"],
-        ):
-            ad_sonuc = None
-
-        elif (
-            merkez_y(
-                soyad_sonuc["item"]
-            )
-            >=
-            merkez_y(
-                ad_sonuc["item"]
-            )
-        ):
-            ad_sonuc = None
-
-        elif (
-            normalize_text(
-                soyad_sonuc.get(
-                    "deger",
-                    "",
-                )
-            )
-            ==
-            normalize_text(
-                ad_sonuc.get(
-                    "deger",
-                    "",
-                )
-            )
-        ):
-            ad_sonuc = None
-
-    # -----------------------------------------------------
-    # 4) Eğer AD düştüyse kalan fiziksel satırlardan tekrar tamamla
-    # -----------------------------------------------------
-    if ad_sonuc is None and soyad_sonuc is not None:
-        kalan = _eski_kullanilan_satiri_cikar(
-            tum_satirlar,
-            soyad_sonuc,
-        )
-
-        soy_y = merkez_y(
-            soyad_sonuc["item"]
-        )
-
-        ad_adaylari = [
-            s
-            for s in kalan
-            if merkez_y(
-                s["item"]
-            )
-            >
-            soy_y + 12
-        ]
-
+        ad_adaylari = [s for s in kalan_satirlar if merkez_y(s["item"]) > soy_y + 12]
         if ad_adaylari:
             ad_sonuc = ad_adaylari[0]
 
-    # -----------------------------------------------------
-    # 5) Label kelimesinin yanlışlıkla değer olarak dönmesini engelle
-    # -----------------------------------------------------
-    ad = (
-        ad_sonuc["deger"]
-        if ad_sonuc
-        else "Bulunamadi"
-    )
+    if soyad_sonuc is not None and ad_sonuc is not None:
+        if _eski_ayni_satir_mi(soyad_sonuc["item"], ad_sonuc["item"]):
+            ad_sonuc = None
+        elif merkez_y(soyad_sonuc["item"]) >= merkez_y(ad_sonuc["item"]):
+            ad_sonuc = None
+        elif normalize_text(soyad_sonuc.get("deger", "")) == normalize_text(ad_sonuc.get("deger", "")):
+            ad_sonuc = None
 
-    soyad = (
-        soyad_sonuc["deger"]
-        if soyad_sonuc
-        else "Bulunamadi"
-    )
+    # ---- Son çare: hâlâ eksikse, kalan satırlardan (kesin eşleşme
+    # kriterlerini geçemeyen ama en azından bir metin bulunan) en yakın
+    # adayı kullan. Boş "Bulunamadi" yerine düşük güvenle de olsa bir
+    # tahmin göstermek, elle kontrol eden kişiye ipucu verir. Confidence
+    # zaten OCR'ın kendi düşük değeri olacağı için mevcut güven/renklendirme
+    # sistemi bunu otomatik olarak "düşük güvenli" işaretler.
+    if soyad_sonuc is None and kalan_satirlar:
+        soyad_sonuc = kalan_satirlar[0]
+        kalan_satirlar = _eski_kullanilan_satiri_cikar(kalan_satirlar, soyad_sonuc)
+    if ad_sonuc is None and kalan_satirlar:
+        ad_sonuc = kalan_satirlar[0]
 
-    if (
-        ad != "Bulunamadi"
-        and
-        _eski_herhangi_bir_label_mi(
-            ad
-        )
-    ):
-        ad = "Bulunamadi"
-        ad_sonuc = None
+    ad = ad_sonuc["deger"] if ad_sonuc else "Bulunamadi"
+    soyad = soyad_sonuc["deger"] if soyad_sonuc else "Bulunamadi"
 
-    if (
-        soyad != "Bulunamadi"
-        and
-        _eski_herhangi_bir_label_mi(
-            soyad
-        )
-    ):
-        soyad = "Bulunamadi"
-        soyad_sonuc = None
+    if ad != "Bulunamadi" and _eski_herhangi_bir_label_mi(ad):
+        ad, ad_sonuc = "Bulunamadi", None
+    if soyad != "Bulunamadi" and _eski_herhangi_bir_label_mi(soyad):
+        soyad, soyad_sonuc = "Bulunamadi", None
 
-    ad_conf = (
-        float(
-            ad_sonuc["item"].get(
-                "conf",
-                0.0,
-            )
-        )
-        if ad_sonuc
-        else 0.0
-    )
+    ad_conf = float(ad_sonuc["item"].get("conf", 0.0)) if ad_sonuc else 0.0
+    soyad_conf = float(soyad_sonuc["item"].get("conf", 0.0)) if soyad_sonuc else 0.0
 
-    soyad_conf = (
-        float(
-            soyad_sonuc["item"].get(
-                "conf",
-                0.0,
-            )
-        )
-        if soyad_sonuc
-        else 0.0
-    )
-
-    bulunan = sum([
-        tc_no != "Bulunamadi",
-        ad != "Bulunamadi",
-        soyad != "Bulunamadi",
-    ])
-
+    bulunan = sum([tc_no != "Bulunamadi", ad != "Bulunamadi", soyad != "Bulunamadi"])
     if bulunan == 3:
-        guven = (
-            "yuksek"
-            if (
-                ad_conf >= 0.50
-                and
-                soyad_conf >= 0.50
-            )
-            else "orta"
-        )
+        guven = "yuksek" if (ad_conf >= 0.50 and soyad_conf >= 0.50) else "orta"
     elif bulunan > 0:
         guven = "orta"
     else:
         guven = "dusuk"
 
     return {
-        "tc_no":
-            tc_no,
-
-        "ad":
-            ad,
-
-        "soyad":
-            soyad,
-
-        "guven":
-            guven,
-
-        "ad_conf":
-            ad_conf,
-
-        "soyad_conf":
-            soyad_conf,
-
-        "tc_item":
-            tc_item,
-
-        "soyad_item":
-            (
-                soyad_sonuc["item"]
-                if soyad_sonuc
-                else None
-            ),
-
-        "ad_item":
-            (
-                ad_sonuc["item"]
-                if ad_sonuc
-                else None
-            ),
+        "tc_no": tc_no, "ad": ad, "soyad": soyad, "guven": guven,
+        "ad_conf": ad_conf, "soyad_conf": soyad_conf,
+        "tc_item": tc_item, "soyad_item": soyad_sonuc["item"] if soyad_sonuc else None,
+        "ad_item": ad_sonuc["item"] if ad_sonuc else None,
     }
 
 
@@ -969,35 +820,7 @@ def _gocmen_satir_isim_bul(satir, label_item):
     if not adaylar:
         return None
     adaylar.sort(key=lambda x: x["x1"])
-    parcalar = [isim_temizle(item["text"]) for item in adaylar]
-    parcalar = [p for p in parcalar if p]
-    if not parcalar:
-        return None
-    text = " ".join(parcalar)
-    conf = sum(float(x.get("conf", 0.0)) for x in adaylar) / len(adaylar)
-    return {
-        "deger": text,
-        "item": {
-            "text": text, "conf": conf,
-            "x1": min(x["x1"] for x in adaylar), "y1": min(x["y1"] for x in adaylar),
-            "x2": max(x["x2"] for x in adaylar), "y2": max(x["y2"] for x in adaylar),
-        },
-        "items": adaylar,
-    }
-
-
-def _gocmen_no_metni_duzelt(text):
-    donusum = {
-        "O": "0", "Q": "0", "D": "0", "I": "1", "İ": "1", "L": "1",
-        "Z": "2", "S": "5", "G": "6", "B": "8",
-    }
-    sonuc = ""
-    for karakter in str(text).upper():
-        if karakter.isdigit():
-            sonuc += karakter
-        elif karakter in donusum:
-            sonuc += donusum[karakter]
-    return sonuc
+    return _parcalari_birlestir(adaylar)
 
 
 def _gocmen_no_bul(ocr):
@@ -1006,7 +829,10 @@ def _gocmen_no_bul(ocr):
         if yabanci_no_gecerli_mi(rakamlar):
             return {"deger": rakamlar, "item": item}
     for item in ocr:
-        aday = _gocmen_no_metni_duzelt(item.get("text", ""))
+        # Göçmen kimlik no'su da TC ile aynı 11 haneli checksum algoritmasını
+        # kullandığı için (99 önekiyle) harf/rakam düzeltmesi de tc_metni_duzelt
+        # ile birebir aynıdır — ayrı bir kopya fonksiyona gerek yok.
+        aday = tc_metni_duzelt(item.get("text", ""))
         if yabanci_no_gecerli_mi(aday):
             return {"deger": aday, "item": item}
     return None
@@ -1031,8 +857,7 @@ def _gocmen_tarih_metne_cevir(tarih):
     return tarih.strftime("%d.%m.%Y") if tarih is not None else "Bulunamadi"
 
 
-def _gocmen_gecerlilik_tarihi_bul(ocr):
-    satirlar = satirlara_grupla(ocr)
+def _gocmen_gecerlilik_tarihi_bul(satirlar):
     adaylar = []
     for satir in satirlar:
         tarihler = []
@@ -1111,7 +936,33 @@ def gocmen_bilgilerini_bul(ocr):
             soyad_label, soyad_sonuc = label, sonuc
             break
 
-    gecerlilik = _gocmen_gecerlilik_tarihi_bul(ocr)
+    gecerlilik = _gocmen_gecerlilik_tarihi_bul(satirlar)
+
+    # ---- Son çare: etiket (ADI/SOYADI) hiç bulunamadıysa, kimlik no'nun
+    # altındaki ilk isim-adayı satırlarını sırayla kullan. Eski TC'deki
+    # "TC altındaki satırlar" yedeğinin göçmen karşılığı — kesin eşleşme
+    # değil ama boş "Bulunamadi" yerine bir tahmin verir.
+    if (ad_sonuc is None or soyad_sonuc is None) and no_sonuc is not None:
+        no_y = merkez_y(no_sonuc["item"])
+        satir_adaylari = []
+        for satir in satirlar:
+            varlar = [it for it in satir if _gocmen_isim_value_mi(it) and merkez_y(it) > no_y]
+            if varlar:
+                birlesik = _parcalari_birlestir(sorted(varlar, key=lambda x: x["x1"]))
+                if birlesik is not None:
+                    satir_adaylari.append(birlesik)
+        satir_adaylari.sort(key=lambda a: merkez_y(a["item"]))
+
+        kalan = [
+            a for a in satir_adaylari
+            if a.get("item") is not (ad_sonuc or {}).get("item")
+            and a.get("item") is not (soyad_sonuc or {}).get("item")
+        ]
+        # Göçmen tablosunda fiziksel sıra: Yabancı Kimlik No -> Adı -> Soyadı.
+        if ad_sonuc is None and kalan:
+            ad_sonuc = kalan.pop(0)
+        if soyad_sonuc is None and kalan:
+            soyad_sonuc = kalan.pop(0)
 
     kimlik_no = no_sonuc["deger"] if no_sonuc else "Bulunamadi"
     ad = ad_sonuc["deger"] if ad_sonuc else "Bulunamadi"
