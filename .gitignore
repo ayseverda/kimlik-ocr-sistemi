@@ -4,9 +4,19 @@ __pycache__/
 .venv/
 venv/
 env/
+exe_ortami/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PyInstaller build kalıntıları
+build/
+dist/
+*.spec
+
+# EasyOCR modelleri
+easyocr_models/
+.EasyOCR/
 
 # İşletim sistemi
 .DS_Store

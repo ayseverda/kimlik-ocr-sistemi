@@ -1,5 +1,7 @@
 import cv2
 import re
+import os
+import sys
 import time
 import threading
 import easyocr
@@ -13,6 +15,20 @@ from difflib import SequenceMatcher
 # EASYOCR — LAZY SINGLETON (bu kısım sorunlu değildi, korunuyor)
 # =========================================================
 
+def _modul_dizini_bul():
+    """PyInstaller ile .exe'ye paketlendiğinde __file__ güvenilir bir yol
+    vermeyebiliyor. sys.frozen + sys._MEIPASS, PyInstaller'ın resmi olarak
+    önerdiği çözüm. Normal çalıştırmada davranış değişmiyor."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+# .exe içine gömülecek EasyOCR modellerinin bulunacağı klasör — build sırasında
+# --add-data ile buraya kopyalanacak. Bu klasör yoksa (normal geliştirme
+# ortamında) hiçbir şey değişmez, EasyOCR eskisi gibi ~/.EasyOCR'a bakar.
+_EASYOCR_MODEL_DIZINI = os.path.join(_modul_dizini_bul(), "easyocr_models")
+
 _READER = None
 _READER_LOCK = threading.Lock()
 
@@ -22,7 +38,17 @@ def reader_getir():
     if _READER is None:
         with _READER_LOCK:
             if _READER is None:
-                _READER = easyocr.Reader(["tr", "en"], gpu=False)
+                if os.path.isdir(_EASYOCR_MODEL_DIZINI):
+                    # Modeller yanımızda gömülü — tamamen offline çalış,
+                    # internete hiç çıkma (download_enabled=False).
+                    _READER = easyocr.Reader(
+                        ["tr", "en"], gpu=False,
+                        model_storage_directory=_EASYOCR_MODEL_DIZINI,
+                        download_enabled=False,
+                    )
+                else:
+                    # Gömülü model yok (ör. geliştirme ortamı) — eski davranış.
+                    _READER = easyocr.Reader(["tr", "en"], gpu=False)
     return _READER
 
 
