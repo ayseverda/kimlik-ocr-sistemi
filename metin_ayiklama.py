@@ -143,6 +143,105 @@ def tc_bul(ocr_sonuclari):
     return "Bulunamadi", None
 
 
+# Bir hane yanlis okundugunda numaranin tamami cope gidiyordu. EasyOCR'in
+# bu yazi tipinde en sik karistirdigi hane ciftleri asagida; checksum tutmayan
+# 11 haneli bir okumada her hane bu alternatiflerle tek tek denenip SADECE tek
+# bir gecerli sonuc cikiyorsa o kabul ediliyor.
+TC_KARISTIRILAN_HANELER = {
+    "0": "68", "1": "7", "2": "7", "3": "89", "4": "9",
+    "5": "68", "6": "058", "7": "12", "8": "0356", "9": "34",
+}
+
+
+def tc_onarmayi_dene(rakamlar):
+    """Checksum'i tutmayan 11 haneli okumada tek hane onarimi dener.
+    Yalnizca TEK bir gecerli sonuc uretiyorsa onu dondurur; birden fazla
+    ihtimal varsa (belirsiz) None doner."""
+    if not rakamlar or len(rakamlar) != 11 or not rakamlar.isdigit():
+        return None
+
+    adaylar = set()
+    for konum, hane in enumerate(rakamlar):
+        for alternatif in TC_KARISTIRILAN_HANELER.get(hane, ""):
+            aday = rakamlar[:konum] + alternatif + rakamlar[konum + 1:]
+            if aday[0] != "0" and tc_kimlik_gecerli_mi(aday):
+                adaylar.add(aday)
+
+    return adaylar.pop() if len(adaylar) == 1 else None
+
+
+def tc_adaylarini_topla(ocr_sonuclari):
+    """OCR ciktisindaki 11 haneli butun okumalari (gecerli olsun olmasin)
+    guven sirasina gore dondurur: [(rakamlar, conf, item), ...]"""
+    adaylar = []
+    for item in ocr_sonuclari:
+        metin = str(item.get("text", ""))
+        for rakamlar in (re.sub(r"\D", "", metin), tc_metni_duzelt(metin)):
+            if len(rakamlar) == 11 and rakamlar[0] != "0":
+                adaylar.append((rakamlar, float(item.get("conf", 0.0) or 0.0), item))
+    adaylar.sort(key=lambda a: a[1], reverse=True)
+    return adaylar
+
+
+def kontrasti_arttir(resim, olcek=1.0):
+    """Solgun fotokopilerde yaziyi belirginlestirir (LAB uzayinda CLAHE).
+
+    Buyutme varsayilan olarak KAPALI: olcumde 2x buyutme okuma basarisini
+    arttirmadigi gibi gecisi ~2.5 kat yavaslatiyordu (EasyOCR kendi olcekleme
+    adimini zaten uyguluyor)."""
+    if resim is None or resim.size == 0:
+        return resim
+    if resim.ndim == 2:
+        gri = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(resim)
+        sonuc = cv2.cvtColor(gri, cv2.COLOR_GRAY2BGR)
+    else:
+        lab = cv2.cvtColor(resim, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        l = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
+        sonuc = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+    if olcek and olcek != 1.0:
+        sonuc = cv2.resize(sonuc, None, fx=olcek, fy=olcek, interpolation=cv2.INTER_CUBIC)
+    return sonuc
+
+
+def tc_seridini_oku(kart, olcek=1.5):
+    """Kartin ustundeki kimlik numarasi seridini SADECE rakam okuyacak sekilde
+    tarar. Harf/rakam karisikligi ortadan kalktigi icin solgun kartlarda normal
+    gecisin okuyamadigi numarayi cikarabiliyor.
+
+    Olcek 1.5 olarak secildi: 3.0x ile ayni (hatta bir tik dusuk) dogruluk
+    verirken kart basina ~2.5 kat daha uzun suruyordu."""
+    if kart is None or kart.size == 0:
+        return []
+
+    h, w = kart.shape[:2]
+    serit = kart[int(h * 0.14):int(h * 0.38), int(w * 0.02):int(w * 0.64)]
+    if serit.size == 0:
+        return []
+
+    gri = cv2.cvtColor(serit, cv2.COLOR_BGR2GRAY) if serit.ndim == 3 else serit
+    gri = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gri)
+    gri = cv2.resize(gri, None, fx=olcek, fy=olcek, interpolation=cv2.INTER_CUBIC)
+
+    try:
+        ham = reader_getir().readtext(gri, detail=1, paragraph=False, allowlist="0123456789")
+    except Exception as exc:
+        print("EasyOCR şerit hatası:", repr(exc))
+        return []
+
+    bulunanlar = []
+    for sonuc in ham:
+        try:
+            _, text, conf = sonuc
+        except Exception:
+            continue
+        text = str(text).strip()
+        if text:
+            bulunanlar.append({"text": text, "norm": text, "conf": float(conf),
+                               "x1": 0, "y1": 0, "x2": 0, "y2": 0})
+    return bulunanlar
+
+
 def yabanci_no_gecerli_mi(no):
     return bool(no) and no.isdigit() and len(no) == 11 and no.startswith("99") and tc_kimlik_gecerli_mi(no)
 
@@ -324,7 +423,7 @@ def label_altindaki_degeri_bul(ocr, label, sonraki_label=None):
     return max(adaylar, key=lambda x: x[0])[1]
 
 
-def tc_bilgilerini_oku(kart, sayfa_no=None, debug=False):
+def tc_bilgilerini_oku(kart, sayfa_no=None, debug=False, derin=True):
     h, w = kart.shape[:2]
     x1, x2 = int(w * 0.02), int(w * 0.70)
     y1, y2 = int(h * 0.15), int(h * 0.70)
@@ -332,11 +431,67 @@ def tc_bilgilerini_oku(kart, sayfa_no=None, debug=False):
 
     ocr, sure = easyocr_oku(roi, x1, y1)
     tc_no, tc_item = tc_bul(ocr)
+    tc_dogrulandi = tc_no != "Bulunamadi"
+    tc_kaynak = "ilk" if tc_dogrulandi else None
+    tum_adaylar = tc_adaylarini_topla(ocr)
+
+    # --- Numara okunamadiysa pes etme -------------------------------------
+    # Solgun/dusuk kontrastli fotokopilerde ilk gecis numarayi ya hic
+    # goremiyor ya da tek haneyi yanlis okuyup checksum'a takiliyordu; her iki
+    # durumda da satir "Bulunamadi" olarak kaliyor, yani veri kaybi oluyordu.
+    if not tc_dogrulandi and derin:
+        # 1) Yalnizca rakam okuyan serit gecisi
+        serit_ocr = tc_seridini_oku(kart)
+        tum_adaylar += tc_adaylarini_topla(serit_ocr)
+        aday, aday_item = tc_bul(serit_ocr)
+        if aday != "Bulunamadi":
+            tc_no, tc_item, tc_dogrulandi, tc_kaynak = aday, tc_item, True, "serit"
+
+    if not tc_dogrulandi and derin:
+        # 2) Kontrast arttirilmis tam bolge
+        kontrast_ocr, kontrast_sure = easyocr_oku(kontrasti_arttir(roi))
+        sure += kontrast_sure
+        tum_adaylar += tc_adaylarini_topla(kontrast_ocr)
+        aday, aday_item = tc_bul(kontrast_ocr)
+        if aday != "Bulunamadi":
+            tc_no, tc_item, tc_dogrulandi, tc_kaynak = aday, aday_item or tc_item, True, "kontrast"
+
+        # Ad/soyad da okunamadiysa bu gecisin sonucunu degerlendir
+        if kontrast_ocr:
+            k_soyad_label = fuzzy_label_bul(kontrast_ocr, SOYAD_LABEL_HEDEFLERI)
+            k_ad_label = fuzzy_label_bul(kontrast_ocr, AD_LABEL_HEDEFLERI)
+            kontrast_ad = label_altindaki_degeri_bul(kontrast_ocr, k_ad_label)
+            kontrast_soyad = label_altindaki_degeri_bul(kontrast_ocr, k_soyad_label, k_ad_label)
+        else:
+            kontrast_ad = kontrast_soyad = None
+    else:
+        kontrast_ad = kontrast_soyad = None
+
+    if not tc_dogrulandi and tum_adaylar:
+        # 3) Tek hane onarimi: 11 hanenin biri yanlis okunmussa duzelt
+        for rakamlar, conf, item in tum_adaylar:
+            onarilmis = tc_onarmayi_dene(rakamlar)
+            if onarilmis:
+                tc_no, tc_item, tc_dogrulandi, tc_kaynak = onarilmis, item, True, "onarim"
+                break
+
+    if not tc_dogrulandi and tum_adaylar:
+        # 4) Hicbiri tutmadi: en guvenli 11 haneli okumayi yine de bildir.
+        #    "Bulunamadi" yazip kimligi kaybetmektense, kullaniciya
+        #    dogrulanmamis numarayi gosterip kontrol ettirmek daha iyi.
+        tc_no, conf, tc_item = tum_adaylar[0]
+        tc_kaynak = "dogrulanmadi"
 
     soyad_label = fuzzy_label_bul(ocr, SOYAD_LABEL_HEDEFLERI)
     ad_label = fuzzy_label_bul(ocr, AD_LABEL_HEDEFLERI)
     soyad_item = label_altindaki_degeri_bul(ocr, soyad_label, ad_label)
     ad_item = label_altindaki_degeri_bul(ocr, ad_label)
+
+    # Kontrast gecisi ad/soyadi bulduysa ve ilk gecis bulamadiysa onu kullan
+    if ad_item is None and kontrast_ad is not None:
+        ad_item = kontrast_ad
+    if soyad_item is None and kontrast_soyad is not None:
+        soyad_item = kontrast_soyad
 
     ad = isim_temizle(ad_item["text"]) if ad_item else "Bulunamadi"
     soyad = isim_temizle(soyad_item["text"]) if soyad_item else "Bulunamadi"
@@ -346,7 +501,7 @@ def tc_bilgilerini_oku(kart, sayfa_no=None, debug=False):
 
     bulunan = sum([tc_no != "Bulunamadi", ad != "Bulunamadi", soyad != "Bulunamadi"])
     if bulunan == 3:
-        guven = "yuksek" if min(kimlik_no_conf, ad_conf, soyad_conf) >= 0.50 else "orta"
+        guven = "yuksek" if (tc_dogrulandi and min(kimlik_no_conf, ad_conf, soyad_conf) >= 0.50) else "orta"
     elif bulunan > 0:
         guven = "orta"
     else:
@@ -363,6 +518,7 @@ def tc_bilgilerini_oku(kart, sayfa_no=None, debug=False):
     return {
         "sayfa_no": sayfa_no, "belge_tipi": "tc", "tc_no": tc_no, "ad": ad, "soyad": soyad,
         "guven": guven, "kimlik_no_conf": kimlik_no_conf, "ad_conf": ad_conf, "soyad_conf": soyad_conf,
+        "tc_dogrulandi": tc_dogrulandi, "tc_kaynak": tc_kaynak,
         "baslangic_tarihi": "", "bitis_tarihi": "", "belge_gecerli": None, "gecerlilik_durumu": None,
         "debug_resmi": debug_resmi, "tum_ocr": ocr if debug else [], "ocr_suresi": sure,
     }
@@ -1051,7 +1207,7 @@ def gocmen_bilgilerini_oku(kart, sayfa_no=None, debug=False):
 # ANA
 # =========================================================
 
-def bilgileri_cimbizla(orijinal_kart, sayfa_no=None, debug=False, belge_tipi="tc"):
+def bilgileri_cimbizla(orijinal_kart, sayfa_no=None, debug=False, belge_tipi="tc", derin=True):
     if orijinal_kart is None:
         return {
             "sayfa_no": sayfa_no, "belge_tipi": belge_tipi, "tc_no": "Bulunamadi",
@@ -1061,7 +1217,15 @@ def bilgileri_cimbizla(orijinal_kart, sayfa_no=None, debug=False, belge_tipi="tc
             "gecerlilik_durumu": None, "debug_resmi": None, "tum_ocr": [], "ocr_suresi": 0.0,
         }
     if belge_tipi == "gocmen":
-        return gocmen_bilgilerini_oku(orijinal_kart, sayfa_no, debug)
-    if belge_tipi == "eski_tc":
-        return eski_tc_bilgilerini_oku(orijinal_kart, sayfa_no, debug)
-    return tc_bilgilerini_oku(orijinal_kart, sayfa_no, debug)
+        sonuc = gocmen_bilgilerini_oku(orijinal_kart, sayfa_no, debug)
+    elif belge_tipi == "eski_tc":
+        sonuc = eski_tc_bilgilerini_oku(orijinal_kart, sayfa_no, debug)
+    else:
+        sonuc = tc_bilgilerini_oku(orijinal_kart, sayfa_no, debug, derin)
+
+    # Numara dogrulama bilgisi her belge tipinde bulunsun; yalnizca yeni T.C.
+    # kimlikte gercek bir deger uretiliyor, digerlerinde numara zaten kendi
+    # kurallariyla dogrulaniyor.
+    sonuc.setdefault("tc_dogrulandi", sonuc.get("tc_no", "Bulunamadi") != "Bulunamadi")
+    sonuc.setdefault("tc_kaynak", None)
+    return sonuc
