@@ -31,7 +31,9 @@ AD_ESLESME_ESIGI = 0.90
 # Numara yokken ada göre eşleştirme bu orandan yüksek benzerlik ister.
 ISIMLE_ESLESME_ESIGI = 0.93
 
-BASLIK_ARAMA_SATIRI = 15
+# Başlık satırdan itibaren başlamak zorunda değil (üstte doküman başlığı,
+# logo, tarih gibi satırlar olabilir); ilk bu kadar satır taranıyor.
+BASLIK_ARAMA_SATIRI = 40
 ICERIK_ARAMA_SATIRI = 250
 
 
@@ -49,22 +51,58 @@ def tc_temizle(deger):
     return rakam if len(rakam) == 11 else ""
 
 
+# Başlık kelimeleri normalize_text'ten (büyük harf + Türkçe harfler sadeleşmiş)
+# geçtiği için "ad", "Ad", "AD", "İsim", "isim" gibi her yazımı aynı kelimeye
+# indirgiyor — büyük/küçük harf ayrımı burada zaten devre dışı.
+_AD_KELIMELERI = {"AD", "ADI", "ISIM", "ISMI"}
+_SOYAD_KELIMELERI = {"SOYAD", "SOYADI", "SOYISIM", "SOYISMI"}
+
+
 def _basliktan_sutunlar(satir_degerleri):
-    """Başlık satırındaki metinlerden sütun eşlemesi kurar."""
+    """Başlık satırındaki metinlerden sütun eşlemesi kurar.
+
+    Kelime bazlı eşleştirme kullanılıyor (ör. "Mahalle Adı" içindeki "ADI"
+    kelimesi "AD" sütunuyla karışmasın diye tam kelime aranıyor, alt dize
+    değil). TC için ise noktalama/boşluk farklılıklarını (T.C., TC No, Tc
+    Numarası...) tolere etmek üzere boşluksuz metinde aranıyor.
+
+    Excel'in en üstünde genelde bir logo/açıklama/uyarı bloğu olur (ör.
+    "MUHTAR İSİM SOYİSİM - TELEFON -TC NO" gibi birleştirilmiş bir hücre);
+    bu tür metinler TEK hücrede hem TC hem AD/SOYAD sinyali taşıdığı için
+    gerçek bir sütun başlığıyla karıştırılabiliyordu. Bir hücrede TC pattern'i
+    AD/SOYAD kelimesiyle birlikte geçiyorsa, bu "karışık" hücre hiçbir alana
+    atanmıyor — gerçek başlıklar tek bir kavramı adlandırır, birden fazlasını
+    aynı anda değil."""
     sutunlar = {}
     for indeks, deger in enumerate(satir_degerleri):
         norm = normalize_text(_metin(deger))
         if not norm:
             continue
-        if "tc" not in sutunlar and ("TC" in norm or "KIMLIK NO" in norm
-                                     or "KIMLIK NUMARA" in norm or norm == "NO"):
+        norm_bosluksuz = norm.replace(" ", "")
+        kelimeler = set(norm.split())
+
+        ad_var = bool(kelimeler & _AD_KELIMELERI)
+        soyad_var = bool(kelimeler & _SOYAD_KELIMELERI)
+        # Yalnız "No" (sıra numarası, fiş no, kayıt no...) TC sinyali SAYILMAZ —
+        # gerçek dünyada bu neredeyse hep bir sıra numarası sütunudur ve TC
+        # kelimesi başka bir sütunda ayrıca yazar.
+        tc_var = (
+            "TC" in norm_bosluksuz or "KIMLIKNO" in norm_bosluksuz
+            or "KIMLIKNUMARA" in norm_bosluksuz
+        )
+
+        if tc_var and (ad_var or soyad_var):
+            continue   # karışık/açıklama hücresi — atla
+
+        if "tc" not in sutunlar and tc_var:
             sutunlar["tc"] = indeks
-        elif "tam_ad" not in sutunlar and ("AD SOYAD" in norm or "ADI SOYADI" in norm
-                                           or "ISIM" in norm or "AD-SOYAD" in norm):
+        elif "tam_ad" not in sutunlar and ad_var and soyad_var:
+            # Aynı hücrede hem "ad" hem "soyad" kelimesi geçiyor: "Ad Soyad",
+            # "Adı Soyadı", "İsim Soyisim" gibi birleşik sütun.
             sutunlar["tam_ad"] = indeks
-        elif "soyad" not in sutunlar and "SOYAD" in norm:
+        elif "soyad" not in sutunlar and soyad_var:
             sutunlar["soyad"] = indeks
-        elif "ad" not in sutunlar and norm in ("AD", "ADI", "AD ", "ADI "):
+        elif "ad" not in sutunlar and ad_var:
             sutunlar["ad"] = indeks
     return sutunlar
 
@@ -103,6 +141,21 @@ def _icerikten_sutunlar(satirlar):
     return sutunlar
 
 
+def _baslik_puani(aday, satir_degerleri):
+    """Bir satırın gerçek sütun başlığı olma ihtimalini puanlar.
+
+    Çok alan bulunması iyi (tc+ad+soyad üçü birden en güçlü sinyal), hücre
+    metinlerinin KISA olması iyi — gerçek başlıklar ("Ad", "TC Kimlik No")
+    kısadır; üstteki açıklama/uyarı satırları uzun cümlelerdir. Tuple
+    karşılaştırması: önce alan sayısı, eşitlikte kısa hücre kazanır."""
+    uzunluklar = [
+        len(_metin(satir_degerleri[idx]))
+        for idx in aday.values() if idx < len(satir_degerleri)
+    ]
+    ort_uzunluk = sum(uzunluklar) / len(uzunluklar) if uzunluklar else 999.0
+    return (len(aday), -ort_uzunluk)
+
+
 def _sayfadan_kayitlar(sayfa):
     satirlar = [list(s) for s in sayfa.iter_rows(values_only=True)]
     if not satirlar:
@@ -110,11 +163,18 @@ def _sayfadan_kayitlar(sayfa):
 
     sutunlar = {}
     baslik_satiri = None
+    en_iyi_puan = None
+    # İlk eşleşen değil, EN İYİ puanlı satır seçiliyor: sayfanın üstünde
+    # açıklama/uyarı metinleri sahte biçimde "başlık gibi" görünebiliyor
+    # (bkz. _basliktan_sutunlar docstring'i). Eşit puanda daha AŞAĞIDAKİ
+    # satır tercih edilir — gerçek başlık genelde veriye en yakın olandır.
     for i, satir in enumerate(satirlar[:BASLIK_ARAMA_SATIRI]):
         aday = _basliktan_sutunlar(satir)
-        if "tc" in aday or "tam_ad" in aday or ("ad" in aday and "soyad" in aday):
-            sutunlar, baslik_satiri = aday, i
-            break
+        if not ("tc" in aday or "tam_ad" in aday or ("ad" in aday and "soyad" in aday)):
+            continue
+        puan = _baslik_puani(aday, satir)
+        if en_iyi_puan is None or puan >= en_iyi_puan:
+            sutunlar, baslik_satiri, en_iyi_puan = aday, i, puan
 
     if not sutunlar:
         sutunlar = _icerikten_sutunlar(satirlar[:ICERIK_ARAMA_SATIRI])
@@ -207,9 +267,14 @@ def _adlar_uyuyor(a, b):
 def karsilastir(bizim_satirlar, dis_kayitlar):
     """Dış liste ile bizim sonuçları eşleştirir.
 
-    Döner: {"eslesen", "ad_farkli", "eksik", "fazla", "ozet"} — her biri
-    satır listesi; "eksik" dış listede olup bizde bulunmayanlar (asıl veri
-    kaybı göstergesi), "fazla" bizde olup listede olmayanlar."""
+    Döner: {"eslesen", "duzeltilmeli", "eksik", "fazla", "ozet"} — her biri
+    satır listesi.
+      - "duzeltilmeli": kişi eşleşti ama bir alan tutmuyor — ya numara AYNI
+        isim farklı (isim OCR hatası olabilir) ya da isim örtüşüyor numara
+        FARKLI (kimlik numarası muhtemelen yanlış okundu). Kayıtta hangisi
+        olduğu "tip" alanında ("ad" | "tc") tutuluyor.
+      - "eksik": dış listede olup bizde bulunmayanlar (asıl veri kaybı).
+      - "fazla": bizde olup listede olmayanlar."""
     bizimkiler = [_bizim_kayit(s) for s in bizim_satirlar]
     bizimkiler = [b for b in bizimkiler if b["tc"] or normalize_text(b["tam_ad"])]
 
@@ -218,7 +283,7 @@ def karsilastir(bizim_satirlar, dis_kayitlar):
         if kayit["tc"]:
             tc_indeks.setdefault(kayit["tc"], []).append(kayit)
 
-    eslesen, ad_farkli, eksik = [], [], []
+    eslesen, duzeltilmeli, eksik = [], [], []
     kullanilan = set()
 
     # 1) Kimlik numarasıyla eşleştir (güçlü anahtar)
@@ -234,7 +299,8 @@ def karsilastir(bizim_satirlar, dis_kayitlar):
         uyum = _adlar_uyuyor(dis["tam_ad"], bizim["tam_ad"])
         kayit = {"dis": dis, "bizim": bizim, "anahtar": "kimlik no"}
         if uyum is False:
-            ad_farkli.append(kayit)
+            # Numara aynı, isim tutmuyor.
+            duzeltilmeli.append({**kayit, "tip": "ad"})
         else:
             eslesen.append(kayit)
 
@@ -250,30 +316,34 @@ def karsilastir(bizim_satirlar, dis_kayitlar):
                 if puan > en_iyi_puan:
                     en_iyi, en_iyi_puan = bizim, puan
 
-        if en_iyi is not None and en_iyi_puan >= ISIMLE_ESLESME_ESIGI:
-            kullanilan.add(id(en_iyi))
-            not_metni = ""
-            if dis["tc"] and en_iyi["tc"] and dis["tc"] != en_iyi["tc"]:
-                not_metni = f"numara farklı (bizde {en_iyi['tc']})"
-            elif dis["tc"] and not en_iyi["tc"]:
-                not_metni = "bizde numara okunamadı"
+        if en_iyi is None or en_iyi_puan < ISIMLE_ESLESME_ESIGI:
+            eksik.append({"dis": dis})
+            continue
+
+        kullanilan.add(id(en_iyi))
+        # İsim örtüşüyor ama her iki tarafta da FARKLI bir numara varsa, bu
+        # "eşleşti" değil — kimlik numarası muhtemelen yanlış okunmuş ve
+        # düzeltilmesi gerekiyor. Eskiden bu durum sessizce "eşleşti" olarak
+        # gösteriliyordu.
+        if dis["tc"] and en_iyi["tc"] and dis["tc"] != en_iyi["tc"]:
+            duzeltilmeli.append({"dis": dis, "bizim": en_iyi, "tip": "tc"})
+        else:
+            not_metni = "bizde numara okunamadı" if dis["tc"] and not en_iyi["tc"] else ""
             eslesen.append({"dis": dis, "bizim": en_iyi, "anahtar": "ad soyad",
                             "not": not_metni})
-        else:
-            eksik.append({"dis": dis})
 
     fazla = [{"bizim": b} for b in bizimkiler if id(b) not in kullanilan]
 
     return {
         "eslesen": eslesen,
-        "ad_farkli": ad_farkli,
+        "duzeltilmeli": duzeltilmeli,
         "eksik": eksik,
         "fazla": fazla,
         "ozet": {
             "dis_toplam": len(dis_kayitlar),
             "bizim_toplam": len(bizimkiler),
             "eslesen": len(eslesen),
-            "ad_farkli": len(ad_farkli),
+            "duzeltilmeli": len(duzeltilmeli),
             "eksik": len(eksik),
             "fazla": len(fazla),
         },
@@ -287,8 +357,8 @@ def ozet_metni(sonuc, dosya_adi=""):
         f"bizde {o['bizim_toplam']} kimlik",
         f"{o['eslesen']} eşleşti",
     ]
-    if o["ad_farkli"]:
-        parcalar.append(f"{o['ad_farkli']} numarası aynı ama adı farklı")
+    if o["duzeltilmeli"]:
+        parcalar.append(f"{o['duzeltilmeli']} kişide veri düzeltilmesi gerekiyor")
     if o["eksik"]:
         parcalar.append(f"{o['eksik']} kayıt bizde YOK")
     if o["fazla"]:
@@ -297,7 +367,12 @@ def ozet_metni(sonuc, dosya_adi=""):
 
 
 def satirlara_don(sonuc):
-    """Sonucu tek bir tabloya (dışa aktarım / gösterim için) çevirir."""
+    """Sonucu tek bir tabloya (dışa aktarım / gösterim için) çevirir.
+
+    Her satırda "_bizim_satir" alanı da bulunur: bizim tabloya karşılık
+    gelen ORİJİNAL satır sözlüğüne referans (yalnız arayüz içi kullanım
+    için — Excel'e aktarılırken bu alan yazılmaz, satirlara_don çağıranı
+    yalnızca kendi başlık listesindeki sütunları dışa aktarmalı)."""
     satirlar = []
     for kayit in sonuc["eslesen"]:
         satirlar.append({
@@ -306,14 +381,22 @@ def satirlara_don(sonuc):
             "Listedeki Ad Soyad": kayit["dis"]["tam_ad"],
             "Bizdeki Ad Soyad": kayit["bizim"]["tam_ad"],
             "Not": kayit.get("not", "") or f"eşleştirme: {kayit['anahtar']}",
+            "_bizim_satir": kayit["bizim"]["satir"],
         })
-    for kayit in sonuc["ad_farkli"]:
+    for kayit in sonuc["duzeltilmeli"]:
+        if kayit["tip"] == "tc":
+            kimlik_no = f"{kayit['bizim']['tc']} → liste: {kayit['dis']['tc']}"
+            not_metni = "isim örtüşüyor, numara farklı — muhtemelen yanlış okundu"
+        else:
+            kimlik_no = kayit["dis"]["tc"]
+            not_metni = "numara aynı, ad tutmuyor"
         satirlar.append({
-            "Durum": "Ad farklı",
-            "Kimlik No": kayit["dis"]["tc"],
+            "Durum": "Eşleşti ama veri düzeltilmesi gerek",
+            "Kimlik No": kimlik_no,
             "Listedeki Ad Soyad": kayit["dis"]["tam_ad"],
             "Bizdeki Ad Soyad": kayit["bizim"]["tam_ad"],
-            "Not": "numara aynı, ad tutmuyor",
+            "Not": not_metni,
+            "_bizim_satir": kayit["bizim"]["satir"],
         })
     for kayit in sonuc["eksik"]:
         satirlar.append({
@@ -322,6 +405,7 @@ def satirlara_don(sonuc):
             "Listedeki Ad Soyad": kayit["dis"]["tam_ad"],
             "Bizdeki Ad Soyad": "",
             "Not": f"listenin {kayit['dis']['satir']}. satırı",
+            "_bizim_satir": None,
         })
     for kayit in sonuc["fazla"]:
         satirlar.append({
@@ -330,5 +414,6 @@ def satirlara_don(sonuc):
             "Listedeki Ad Soyad": "",
             "Bizdeki Ad Soyad": kayit["bizim"]["tam_ad"],
             "Not": "bizde okundu, listede karşılığı yok",
+            "_bizim_satir": kayit["bizim"]["satir"],
         })
     return satirlar

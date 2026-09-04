@@ -1,1131 +1,61 @@
+# -*- coding: utf-8 -*-
+"""Kimlik Okuyucu masaustu uygulamasi -- giris noktasi.
+
+Kod tabani asagidaki modullere bolundu (eskiden hepsi bu dosyadaydi, dosya
+3000 satira yaklasinca okunmasi/degistirilmesi zorlasmisti):
+
+    gorsel_araclari.py   PDF/Excel/JPG <-> OpenCV/Qt goruntu donusumleri
+    worker.py             Worker, AlanOkuyucu (arka plan tespit/OCR is parcaciklari)
+    pencereler.py          KarsilastirmaPenceresi, GecmisPenceresi
+    onizleme_widget.py     OnizlemeEtiketi (fareyle bolge secilen onizleme)
+    desktop_stil.py        koyu tema QSS'i
+    gecmis.py, karsilastirma.py, excel_kaynak.py  (onceden de ayriydi)
+
+Bu dosyada yalnizca MainWindow -- yani asil pencere/tablo/is akisi -- kaliyor."""
+
 import sys
 import os
 import time
 from datetime import datetime
 import tempfile
-import subprocess
-from io import BytesIO
 
 import cv2
 import numpy as np
 import pandas as pd
 import pymupdf
-from PIL import Image
 from openpyxl import load_workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import PatternFill, Font
-from openpyxl.utils import get_column_letter
 
-from PySide6.QtCore import Qt, QThread, Signal, QEvent, QRect, QSize, QPoint, QTimer
-from PySide6.QtGui import QImage, QPixmap, QColor
+from PySide6.QtCore import Qt, QEvent, QTimer
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLabel, QTableWidget, QTableWidgetItem,
     QProgressBar, QMessageBox, QCheckBox, QSplitter, QHeaderView,
     QAbstractItemView, QTextEdit, QScrollArea, QSizePolicy, QFrame,
-    QRubberBand, QDialog
+    QRubberBand, QDialog, QButtonGroup
 )
 
-from goruntu_isleme import kartlari_tespit_et_ve_duzelt, sayfa_sirasina_diz
-from metin_ayiklama import bilgileri_cimbizla, normalize_text, benzerlik
+from goruntu_isleme import sayfa_sirasina_diz
 import gecmis
 import excel_kaynak
 import karsilastirma
+
+from gorsel_araclari import (
+    pixmap_to_bgr, dosyayi_goruntulere_ayir, resmi_pdfe_ekle, bgr_to_pixmap,
+    dosyayi_sistemde_ac, PDF_RENDER_DPI, DESTEKLENEN,
+)
+from worker import Worker, AlanOkuyucu
+from pencereler import KarsilastirmaPenceresi, GecmisPenceresi
+from onizleme_widget import OnizlemeEtiketi
+from desktop_stil import KOYU_TEMA
 
 BUILD_ID = "DESKTOP-IMAGE-FIX-V10"
 print(f"[DESKTOP BUILD] {BUILD_ID}")
 print(f"[DESKTOP FILE] {__file__}")
 print(f"[CV2 FILE] {getattr(cv2, '__file__', '?')}")
 print(f"[CV2 VERSION] {getattr(cv2, '__version__', '?')}")
-
-
-
-# Tespit cozemedigi halde "kart buyuklugunde" duran bloklar, dogrudan
-# OCR'lanip kurtarilmaya calisilir: gecerli bir TC numarasi cikarsa o kimlik
-# sessizce kaybolmak yerine tabloya "kurtarildi" satiri olarak girer.
-KURTARMA_AZAMI_BOLGE = 3
-KURTARMA_HEDEF_GENISLIK = 1000
-
-PDF_RENDER_DPI = 170
-MAX_GORUNTU_PIKSEL = 40_000_000
-DESTEKLENEN = {".jpg", ".jpeg", ".png", ".pdf", ".xlsx", ".xlsm"}
-
-# Excel'de yazan ad ile okunan ad bu orandan az benzerse uyuşmazlık bildirilir.
-# Karşılaştırma öncesi Türkçe harfler sadeleştiği için (Ş→S, Ü→U…) doğru
-# okumalar 1.00 veriyor; eşik bu yüzden yüksek tutulabiliyor.
-AD_BENZERLIK_ESIGI = 0.95
-
-
-def pixmap_to_bgr(pix):
-    """
-    PyMuPDF Pixmap -> OpenCV BGR.
-
-    PNG'ye yeniden encode/decode etmez; pixmap'in stride/padding
-    değerini doğrudan hesaba katar. Farklı PyMuPDF sürümlerinde
-    daha uyumludur.
-    """
-    if pix is None:
-        raise ValueError("Pixmap boş.")
-
-    h = int(pix.height)
-    w = int(pix.width)
-    n = int(pix.n)
-    stride = int(pix.stride)
-
-    if h <= 0 or w <= 0 or n <= 0 or stride <= 0:
-        raise ValueError(
-            f"Geçersiz pixmap: w={w}, h={h}, n={n}, stride={stride}"
-        )
-
-    ham = np.frombuffer(
-        pix.samples,
-        dtype=np.uint8,
-    )
-
-    beklenen = h * stride
-    if ham.size < beklenen:
-        raise ValueError(
-            f"Pixmap byte sayısı yetersiz: {ham.size} < {beklenen}"
-        )
-
-    # Her satırdaki olası padding'i at.
-    satirlar = ham[:beklenen].reshape(h, stride)
-    piksel_bayt = w * n
-
-    if stride < piksel_bayt:
-        raise ValueError(
-            f"Pixmap stride beklenenden küçük: stride={stride}, "
-            f"w*n={piksel_bayt}"
-        )
-
-    img = satirlar[:, :piksel_bayt].reshape(
-        h,
-        w,
-        n,
-    )
-
-    if n == 4:
-        return cv2.cvtColor(
-            img,
-            cv2.COLOR_RGBA2BGR,
-        )
-
-    if n == 3:
-        return cv2.cvtColor(
-            img,
-            cv2.COLOR_RGB2BGR,
-        )
-
-    if n == 1:
-        return cv2.cvtColor(
-            img[:, :, 0],
-            cv2.COLOR_GRAY2BGR,
-        )
-
-    raise ValueError(
-        f"Desteklenmeyen pixmap kanal sayısı: {n}"
-    )
-
-
-def dosyayi_goruntulere_ayir(yol):
-    """(sayfa_no, görüntü, hata, ek_bilgi) üretir.
-
-    ek_bilgi yalnız Excel kaynağında dolu: o bantta Excel'in kendi yazdığı
-    kişi adını taşır."""
-    ext = os.path.splitext(yol)[1].lower()
-
-    if ext in (".xlsx", ".xlsm"):
-        # Her bant (kişi) tek sayfa gibi ele alınır: bandın fotoğrafları
-        # Excel'deki gibi yan yana birleştirilip verilir.
-        try:
-            bantlar = excel_kaynak.bantlari_bul(yol)
-        except Exception as e:
-            yield None, None, f"Excel okunamadı: {type(e).__name__}: {e}", None
-            return
-
-        if not bantlar:
-            yield None, None, "Excel dosyasında gömülü kimlik fotoğrafı bulunamadı.", None
-            return
-
-        for bant in bantlar:
-            ek = {"excel_adi": bant.get("ad", ""), "excel_satiri": bant.get("excel_satiri")}
-            try:
-                resim = excel_kaynak.bandi_birlestir(bant["gorseller"])
-            except Exception as e:
-                yield bant["no"], None, f"Excel görüntüsü çözülemedi: {e}", ek
-                continue
-            if resim is None:
-                yield bant["no"], None, "Excel görüntüsü okunamadı.", ek
-            else:
-                yield bant["no"], resim, None, ek
-        return
-
-    if ext == ".pdf":
-        doc = pymupdf.open(yol)
-        try:
-            for sayfa_no, sayfa in enumerate(doc, start=1):
-                tahmini_w = max(1, int(sayfa.rect.width * PDF_RENDER_DPI / 72))
-                tahmini_h = max(1, int(sayfa.rect.height * PDF_RENDER_DPI / 72))
-                if tahmini_w * tahmini_h > MAX_GORUNTU_PIKSEL:
-                    yield sayfa_no, None, "Sayfa çözünürlüğü güvenli sınırı aşıyor.", None
-                    continue
-                try:
-                    # Streamlit'te çalışan çağrının aynısı.
-                    # colorspace sabiti vermiyoruz; eski/yeni PyMuPDF
-                    # sürümleri arasındaki uyumsuzluğu da böyle önlüyoruz.
-                    pix = sayfa.get_pixmap(
-                        dpi=PDF_RENDER_DPI,
-                        alpha=False,
-                    )
-                    resim = pixmap_to_bgr(
-                        pix
-                    )
-                    yield sayfa_no, resim, None, None
-
-                except Exception as e:
-                    hata = (
-                        "PDF sayfası görüntüye çevrilemedi: "
-                        f"{type(e).__name__}: {e}"
-                    )
-
-                    print(
-                        f"[PDF HATA] {os.path.basename(yol)} "
-                        f"/ sayfa {sayfa_no}: {hata}",
-                        flush=True,
-                    )
-
-                    yield sayfa_no, None, hata, None
-        finally:
-            doc.close()
-    else:
-        try:
-            # Windows'ta cv2.imread, Türkçe/özel karakterli dosya
-            # yollarında zaman zaman başarısız olabiliyor.
-            # JPG/PNG'yi Pillow ile okuyup OpenCV BGR'ye çeviriyoruz.
-            from PIL import ImageOps
-
-            with Image.open(yol) as im:
-                im = ImageOps.exif_transpose(im)
-
-                w, h = im.size
-
-                if w * h > MAX_GORUNTU_PIKSEL:
-                    yield (
-                        None,
-                        None,
-                        f"Görüntü çözünürlüğü güvenli sınırı aşıyor ({w}×{h}).",
-                        None,
-                    )
-                    return
-
-                im = im.convert("RGB")
-                rgb = np.array(im)
-
-            if rgb is None or rgb.size == 0:
-                yield None, None, "Görüntü boş veya okunamadı.", None
-                return
-
-            resim = cv2.cvtColor(
-                rgb,
-                cv2.COLOR_RGB2BGR,
-            )
-
-            yield None, resim, None, None
-
-        except Exception as e:
-            hata = (
-                "Görüntü okunamadı: "
-                f"{type(e).__name__}: {e}"
-            )
-
-            print(
-                f"[GÖRÜNTÜ HATA] {os.path.basename(yol)}: {hata}",
-                flush=True,
-            )
-
-            yield None, None, hata, None
-
-
-def resmi_pdfe_ekle(pdf_doc, resim):
-    if resim is None:
-        return False
-    try:
-        h, w = resim.shape[:2]
-        ok, encoded = cv2.imencode(".jpg", resim, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        if not ok:
-            return False
-        pw = 720.0
-        ph = pw * h / w
-        page = pdf_doc.new_page(width=pw, height=ph)
-        page.insert_image(pymupdf.Rect(0, 0, pw, ph), stream=encoded.tobytes(), keep_proportion=True)
-        return True
-    except Exception:
-        return False
-
-
-def bgr_to_pixmap(img, max_w=650, max_h=700):
-    if img is None:
-        return QPixmap()
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    h, w, ch = rgb.shape
-    qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888).copy()
-    return QPixmap.fromImage(qimg).scaled(max_w, max_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-
-def dosyayi_sistemde_ac(yol):
-    """
-    Oluşturulan Excel/PDF dosyasını varsayılan masaüstü uygulamasıyla açar.
-
-    Windows:
-        os.startfile
-    macOS:
-        open
-    Linux:
-        xdg-open
-    """
-    if not yol or not os.path.exists(yol):
-        raise FileNotFoundError(
-            f"Dosya bulunamadı: {yol}"
-        )
-
-    if sys.platform.startswith("win"):
-        os.startfile(yol)
-        return
-
-    if sys.platform == "darwin":
-        subprocess.Popen(
-            ["open", yol]
-        )
-        return
-
-    subprocess.Popen(
-        ["xdg-open", yol]
-    )
-
-
-
-
-class KarsilastirmaPenceresi(QDialog):
-    """Dış listeyle karşılaştırma sonucunu gösterir.
-
-    En önemli satırlar "Bizde yok" olanlar: dış listede kayıtlı olduğu halde
-    bizim çıkardığımız sonuçlarda karşılığı bulunmayan kimlikler."""
-
-    RENKLER = {
-        "Eşleşti": "#86efac",
-        "Ad farklı": "#f0b429",
-        "Bizde yok": "#ff6b6b",
-        "Listede yok": "#93c5fd",
-    }
-
-    def __init__(self, sonuc, bilgi, dosya_adi, ebeveyn=None):
-        super().__init__(ebeveyn)
-        self.setWindowTitle("Liste karşılaştırması")
-        self.resize(1020, 620)
-        self.sonuc = sonuc
-        self.satirlar = karsilastirma.satirlara_don(sonuc)
-
-        duzen = QVBoxLayout(self)
-
-        ozet = QLabel(karsilastirma.ozet_metni(sonuc, dosya_adi))
-        ozet.setWordWrap(True)
-        ozet.setStyleSheet("color: #f3f4f6; font-size: 15px; font-weight: 700;")
-        duzen.addWidget(ozet)
-
-        sutun_yazi = ", ".join(f"{ad}={sutun}" for ad, sutun in
-                               sorted((bilgi.get("sutunlar") or {}).items()))
-        ayrinti = QLabel(
-            f"Okunan sayfa: {bilgi.get('sayfa', '-')}   •   "
-            f"başlık satırı: {bilgi.get('baslik_satiri') or 'yok'}   •   "
-            f"sütunlar: {sutun_yazi or '-'}"
-        )
-        ayrinti.setWordWrap(True)
-        ayrinti.setStyleSheet("color: #9aa3ad; font-size: 12px;")
-        duzen.addWidget(ayrinti)
-
-        self.tablo = QTableWidget()
-        self.basliklar = ["Durum", "Kimlik No", "Listedeki Ad Soyad",
-                          "Bizdeki Ad Soyad", "Not"]
-        self.tablo.setColumnCount(len(self.basliklar))
-        self.tablo.setHorizontalHeaderLabels(self.basliklar)
-        self.tablo.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.tablo.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.tablo.setAlternatingRowColors(True)
-        self.tablo.verticalHeader().setVisible(False)
-        for i, genislik in enumerate([110, 130, 230, 230, 280]):
-            self.tablo.setColumnWidth(i, genislik)
-        duzen.addWidget(self.tablo, 1)
-
-        dugmeler = QHBoxLayout()
-        self.filtre_btn = QPushButton("Yalnız sorunluları göster")
-        self.filtre_btn.setCheckable(True)
-        self.aktar_btn = QPushButton("Excel’e aktar ve aç")
-        self.kapat_btn = QPushButton("Kapat")
-        for b in (self.filtre_btn, self.aktar_btn, self.kapat_btn):
-            b.setMinimumHeight(36)
-        dugmeler.addWidget(self.filtre_btn)
-        dugmeler.addStretch(1)
-        dugmeler.addWidget(self.aktar_btn)
-        dugmeler.addWidget(self.kapat_btn)
-        duzen.addLayout(dugmeler)
-
-        self.filtre_btn.toggled.connect(self.tabloyu_doldur)
-        self.aktar_btn.clicked.connect(self.excele_aktar)
-        self.kapat_btn.clicked.connect(self.accept)
-
-        self.tabloyu_doldur()
-
-    def gosterilecek_satirlar(self):
-        if self.filtre_btn.isChecked():
-            return [s for s in self.satirlar if s["Durum"] != "Eşleşti"]
-        return self.satirlar
-
-    def tabloyu_doldur(self):
-        satirlar = self.gosterilecek_satirlar()
-        # Sorunlular üstte olsun: bizde olmayanlar, ad farklılıkları, sonra kalanlar.
-        oncelik = {"Bizde yok": 0, "Ad farklı": 1, "Listede yok": 2, "Eşleşti": 3}
-        satirlar = sorted(satirlar, key=lambda s: oncelik.get(s["Durum"], 9))
-
-        self.tablo.setRowCount(0)
-        for satir in satirlar:
-            r = self.tablo.rowCount()
-            self.tablo.insertRow(r)
-            for c, baslik in enumerate(self.basliklar):
-                item = QTableWidgetItem(str(satir.get(baslik, "")))
-                if c == 0:
-                    item.setForeground(QColor(self.RENKLER.get(satir["Durum"], "#f3f4f6")))
-                self.tablo.setItem(r, c, item)
-
-    def excele_aktar(self):
-        if not self.satirlar:
-            return
-        try:
-            fd, yol = tempfile.mkstemp(prefix="karsilastirma_", suffix=".xlsx")
-            os.close(fd)
-
-            df = pd.DataFrame(self.satirlar, columns=self.basliklar)
-            df.to_excel(yol, index=False, engine="openpyxl")
-
-            wb = load_workbook(yol)
-            ws = wb.active
-            ws.title = "Karşılaştırma"
-            for hucre in ws[1]:
-                hucre.font = Font(bold=True)
-
-            dolgular = {
-                "Bizde yok": PatternFill("solid", fgColor="FFC7CE"),
-                "Ad farklı": PatternFill("solid", fgColor="FFD9A0"),
-                "Listede yok": PatternFill("solid", fgColor="DDEBF7"),
-            }
-            for i, satir in enumerate(self.satirlar, start=2):
-                dolgu = dolgular.get(satir["Durum"])
-                if dolgu:
-                    for c in range(1, len(self.basliklar) + 1):
-                        ws.cell(i, c).fill = dolgu
-
-            for harf, genislik in zip("ABCDE", (14, 16, 28, 28, 34)):
-                ws.column_dimensions[harf].width = genislik
-
-            wb.save(yol)
-            dosyayi_sistemde_ac(yol)
-        except Exception as e:
-            QMessageBox.critical(self, "Aktarma hatası", str(e))
-
-
-class GecmisPenceresi(QDialog):
-    """Kayıtlı taramaları listeler; seçileni açar, siler veya hepsini temizler."""
-
-    def __init__(self, ebeveyn=None):
-        super().__init__(ebeveyn)
-        self.setWindowTitle("Geçmiş taramalar")
-        self.resize(760, 460)
-        self.secilen_yol = None
-
-        duzen = QVBoxLayout(self)
-
-        self.bilgi = QLabel("")
-        self.bilgi.setWordWrap(True)
-        duzen.addWidget(self.bilgi)
-
-        self.liste = QTableWidget()
-        self.basliklar = ["Tarih", "Dosyalar", "Kimlik", "Satır", "Boyut"]
-        self.liste.setColumnCount(len(self.basliklar))
-        self.liste.setHorizontalHeaderLabels(self.basliklar)
-        self.liste.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.liste.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.liste.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.liste.setAlternatingRowColors(True)
-        self.liste.verticalHeader().setVisible(False)
-        for i, genislik in enumerate([160, 330, 80, 70, 90]):
-            self.liste.setColumnWidth(i, genislik)
-        self.liste.doubleClicked.connect(self.ac)
-        duzen.addWidget(self.liste, 1)
-
-        dugmeler = QHBoxLayout()
-        self.ac_btn = QPushButton("Aç")
-        self.sil_btn = QPushButton("Seçileni sil")
-        self.temizle_btn = QPushButton("Geçmişi temizle")
-        self.kapat_btn = QPushButton("Kapat")
-        for b in (self.ac_btn, self.sil_btn, self.temizle_btn, self.kapat_btn):
-            b.setMinimumHeight(36)
-        self.temizle_btn.setStyleSheet(
-            "QPushButton { background-color: #4a2020; border-color: #7a3030; }"
-        )
-
-        dugmeler.addWidget(self.ac_btn)
-        dugmeler.addWidget(self.sil_btn)
-        dugmeler.addStretch(1)
-        dugmeler.addWidget(self.temizle_btn)
-        dugmeler.addWidget(self.kapat_btn)
-        duzen.addLayout(dugmeler)
-
-        self.ac_btn.clicked.connect(self.ac)
-        self.sil_btn.clicked.connect(self.sil)
-        self.temizle_btn.clicked.connect(self.temizle)
-        self.kapat_btn.clicked.connect(self.reject)
-
-        self.yenile()
-
-    def yenile(self):
-        self.kayitlar = gecmis.taramalari_listele()
-        self.liste.setRowCount(0)
-
-        for kayit in self.kayitlar:
-            r = self.liste.rowCount()
-            self.liste.insertRow(r)
-            try:
-                tarih = datetime.fromisoformat(kayit.get("tarih", "")).strftime("%d.%m.%Y %H:%M")
-            except (ValueError, TypeError):
-                tarih = kayit.get("tarih", "")
-            if kayit.get("guncellendi"):
-                try:
-                    tarih += datetime.fromisoformat(kayit["guncellendi"]).strftime(
-                        "  (düzenlendi %H:%M)")
-                except (ValueError, TypeError):
-                    tarih += "  (düzenlendi)"
-            dosyalar = ", ".join(kayit.get("dosyalar", []))
-            degerler = [
-                tarih,
-                dosyalar,
-                str(kayit.get("kimlik_sayisi", "")),
-                str(kayit.get("satir_sayisi", "")),
-                f"{kayit.get('boyut', 0) / 1024 / 1024:.1f} MB",
-            ]
-            for c, deger in enumerate(degerler):
-                item = QTableWidgetItem(deger)
-                if c == 1:
-                    item.setToolTip(dosyalar)
-                self.liste.setItem(r, c, item)
-
-        toplam = sum(k.get("boyut", 0) for k in self.kayitlar)
-        self.bilgi.setText(
-            f"{len(self.kayitlar)} tarama saklanıyor (toplam {toplam / 1024 / 1024:.1f} MB). "
-            f"En yeni {gecmis.AZAMI_KAYIT} tarama tutulur, eskiler kendiliğinden silinir.\n"
-            f"Klasör: {gecmis.gecmis_dizini()}"
-        )
-        self.ac_btn.setEnabled(bool(self.kayitlar))
-        self.sil_btn.setEnabled(bool(self.kayitlar))
-        self.temizle_btn.setEnabled(bool(self.kayitlar))
-        if self.kayitlar:
-            self.liste.selectRow(0)
-
-    def secili_kayit(self):
-        r = self.liste.currentRow()
-        if 0 <= r < len(self.kayitlar):
-            return self.kayitlar[r]
-        return None
-
-    def ac(self):
-        kayit = self.secili_kayit()
-        if kayit:
-            self.secilen_yol = kayit["yol"]
-            self.accept()
-
-    def sil(self):
-        kayit = self.secili_kayit()
-        if not kayit:
-            return
-        if QMessageBox.question(
-            self, "Kaydı sil",
-            f"{', '.join(kayit.get('dosyalar', []))} taraması silinsin mi?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        ) == QMessageBox.Yes:
-            gecmis.taramayi_sil(kayit["yol"])
-            self.yenile()
-
-    def temizle(self):
-        if QMessageBox.question(
-            self, "Geçmişi temizle",
-            "Kayıtlı bütün taramalar silinsin mi?\n"
-            "Bu dosyalar kimlik numarası ve isim içerir; silme geri alınamaz.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        ) == QMessageBox.Yes:
-            gecmis.gecmisi_temizle()
-            self.yenile()
-
-
-class OnizlemeEtiketi(QLabel):
-    """Üzerinde fareyle dikdörtgen seçilebilen önizleme alanı.
-
-    Tespitin kaçırdığı bir kimliği kullanıcı kendisi çerçeveleyebilsin diye;
-    seçim, gösterilen pixmap'in kendi koordinatlarında bildirilir."""
-
-    alan_secildi = Signal(object)   # QRect (pixmap koordinatı) veya None
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._baslangic = None
-        self._band = QRubberBand(QRubberBand.Rectangle, self)
-
-    def pixmap_ofseti(self):
-        """Pixmap ortalanmış çiziliyor; sol üst köşesinin widget içindeki yeri."""
-        pm = self.pixmap()
-        if pm is None or pm.isNull():
-            return None
-        return QPoint(max(0, (self.width() - pm.width()) // 2),
-                      max(0, (self.height() - pm.height()) // 2))
-
-    def secimi_temizle(self):
-        self._baslangic = None
-        self._band.hide()
-
-    def mousePressEvent(self, olay):
-        if olay.button() != Qt.LeftButton or self.pixmap() is None:
-            return
-        self._baslangic = olay.position().toPoint()
-        self._band.setGeometry(QRect(self._baslangic, QSize()))
-        self._band.show()
-
-    def mouseMoveEvent(self, olay):
-        if self._baslangic is not None:
-            self._band.setGeometry(
-                QRect(self._baslangic, olay.position().toPoint()).normalized()
-            )
-
-    def mouseReleaseEvent(self, olay):
-        if self._baslangic is None:
-            return
-        kutu = QRect(self._baslangic, olay.position().toPoint()).normalized()
-        self._baslangic = None
-
-        ofset = self.pixmap_ofseti()
-        pm = self.pixmap()
-        if ofset is None or kutu.width() < 12 or kutu.height() < 12:
-            self._band.hide()
-            self.alan_secildi.emit(None)
-            return
-
-        kutu.translate(-ofset.x(), -ofset.y())
-        kutu = kutu.intersected(QRect(0, 0, pm.width(), pm.height()))
-        if kutu.width() < 10 or kutu.height() < 10:
-            self._band.hide()
-            self.alan_secildi.emit(None)
-            return
-
-        self.alan_secildi.emit(kutu)
-
-
-class AlanOkuyucu(QThread):
-    """Kullanıcının seçtiği alanı arka planda okur (arayüz donmasın).
-
-    Önce seçilen parçada normal kart tespiti denenir — bulunursa kart
-    hizalanmış haliyle okunur, bu en iyi sonucu verir. Bulunamazsa seçilen
-    alan doğrudan büyütülüp okunur."""
-
-    bitti = Signal(dict)
-    hata = Signal(str)
-
-    def __init__(self, kirpma, debug=False):
-        super().__init__()
-        self.kirpma = kirpma
-        self.debug = debug
-
-    def run(self):
-        try:
-            kart = None
-            belge_tipi = "tc"
-            hizalandi = False
-            try:
-                adaylar = [
-                    k for k in kartlari_tespit_et_ve_duzelt(self.kirpma, debug_kart=self.debug)
-                    if k.get("basarili")
-                ]
-            except Exception:
-                adaylar = []
-
-            if adaylar:
-                kart = adaylar[0].get("kart")
-                belge_tipi = adaylar[0].get("belge_tipi", "tc")
-                hizalandi = True
-            else:
-                kart = self.kirpma
-                if kart.shape[1] < KURTARMA_HEDEF_GENISLIK:
-                    olcek = KURTARMA_HEDEF_GENISLIK / float(kart.shape[1])
-                    kart = cv2.resize(kart, None, fx=olcek, fy=olcek,
-                                      interpolation=cv2.INTER_CUBIC)
-                kart = np.ascontiguousarray(kart)
-
-            ocr_sonuc = bilgileri_cimbizla(kart, debug=self.debug, belge_tipi=belge_tipi)
-            self.bitti.emit({
-                "kart": kart, "ocr": ocr_sonuc,
-                "belge_tipi": belge_tipi, "hizalandi": hizalandi,
-            })
-        except Exception as exc:
-            self.hata.emit(f"{type(exc).__name__}: {exc}")
-
-
-class Worker(QThread):
-    progress = Signal(int, int, str)
-    row_ready = Signal(dict)
-    finished_ok = Signal(list, object, bool)
-    failed = Signal(str)
-
-    def __init__(self, dosyalar, debug=False, kurtar=True, coklu=True, derin=True):
-        super().__init__()
-        self.dosyalar = dosyalar
-        self.debug = debug
-        self.kurtar = kurtar
-        self.coklu = coklu
-        self.derin = derin
-        self._durduruldu = False
-
-    def durdur(self):
-        """Dışarıdan (ana thread'den) çağrılır. Basit bir bool bayrak —
-        Python'da GIL sayesinde tek bir attribute yazımı thread-safe kabul
-        edilir, ekstra kilide gerek yok. run() döngüsü bunu her sayfa
-        aralığında kontrol eder; şu an işlenmekte olan sayfa yarıda
-        kesilmez, bir SONRAKİ sayfaya geçmeden döngü sonlanır."""
-        self._durduruldu = True
-
-    def run(self):
-        try:
-            isler = []
-            for yol in self.dosyalar:
-                if yol.lower().endswith(".pdf"):
-                    try:
-                        with pymupdf.open(yol) as d:
-                            for p in range(1, d.page_count + 1):
-                                isler.append((yol, p))
-                    except Exception:
-                        isler.append((yol, None))
-                elif excel_kaynak.excel_mi(yol):
-                    try:
-                        for bant in excel_kaynak.bantlari_bul(yol):
-                            isler.append((yol, bant["no"]))
-                    except Exception:
-                        isler.append((yol, None))
-                else:
-                    isler.append((yol, None))
-
-            toplam = max(1, len(isler))
-            sonuclar = []
-            sayac = 0
-
-            for yol in self.dosyalar:
-                if self._durduruldu:
-                    break
-                for sayfa_no, resim, girdi_hatasi, ek_bilgi in dosyayi_goruntulere_ayir(yol):
-                    if self._durduruldu:
-                        break
-                    sayac += 1
-                    self.progress.emit(sayac, toplam, f"{os.path.basename(yol)} işleniyor")
-
-                    baslangic = time.perf_counter()
-                    kart_sonuclari = []
-                    tespit_hatasi = girdi_hatasi
-
-                    if resim is not None:
-                        try:
-                            # Bir sayfada birden fazla kimlik olabilir; hepsi
-                            # ayrı ayrı tespit edilip ayrı satır olarak işlenir.
-                            kart_sonuclari = kartlari_tespit_et_ve_duzelt(
-                                resim, debug_kart=self.debug, ek_tarama=self.coklu
-                            )
-                        except Exception as e:
-                            tespit_hatasi = f"Kart tespit hatası: {e}"
-
-                    if not kart_sonuclari:
-                        kart_sonuclari = [{}]
-
-                    tespit_suresi = time.perf_counter() - baslangic
-                    kart_sayisi = sum(1 for k in kart_sonuclari if k.get("basarili"))
-
-                    sayfa_satirlari = []
-                    for sira, kart_sonuc in enumerate(kart_sonuclari, start=1):
-                        sayfa_satirlari.append(self._satir_olustur(
-                            yol=yol,
-                            sayfa_no=sayfa_no,
-                            resim=resim,
-                            kart_sonuc=kart_sonuc,
-                            sira=sira,
-                            kart_sayisi=kart_sayisi,
-                            tespit_hatasi=tespit_hatasi,
-                            # Tespit süresi sayfanın tamamı için bir kez harcanır;
-                            # sayfanın ilk satırına yazılır, diğerlerine yazılmaz.
-                            ek_sure=tespit_suresi if sira == 1 else 0.0,
-                            ek_bilgi=ek_bilgi,
-                        ))
-
-                    if ek_bilgi is not None:
-                        sayfa_satirlari = self._excel_bandini_sadelestir(
-                            sayfa_satirlari, ek_bilgi
-                        )
-
-                    # Tespitin çözemediği kart bloklarını doğrudan okumayı dene.
-                    # Sadece sayfadan HİÇ kart çıkmadığında: kart bulunan
-                    # sayfalarda arta kalan bloklar çoğunlukla kimliğin arka
-                    # yüzü oluyor ve oradan üretilen satır hayalet kayıt olur.
-                    if self.kurtar and resim is not None and kart_sayisi == 0:
-                        kurtarilan = self._kurtarma_satirlari(
-                            yol=yol,
-                            sayfa_no=sayfa_no,
-                            resim=resim,
-                            bolgeler=(kart_sonuclari[0] or {}).get("kurtarma_bolgeleri", []),
-                            mevcut_satirlar=sayfa_satirlari,
-                        )
-                        if kurtarilan:
-                            # Sayfada hiç kart bulunamadıysa "bulunamadı" satırı
-                            # artık yanıltıcı olur; kurtarılan kimlikler onun yerini alır.
-                            if kart_sayisi == 0:
-                                sayfa_satirlari = []
-                            sayfa_satirlari.extend(kurtarilan)
-
-                    for row in sayfa_satirlari:
-                        sonuclar.append(row)
-                        self.row_ready.emit(row)
-
-            # PDF artık burada üretilmiyor: kullanıcı elle kimlik ekleyip
-            # sırayı değiştirebildiği için, kaydetme anında tablodaki güncel
-            # sıradan üretiliyor (bkz. MainWindow.pdf_kaydet).
-            self.finished_ok.emit(sonuclar, None, self._durduruldu)
-        except Exception as e:
-            self.failed.emit(repr(e))
-
-    def _excel_bandini_sadelestir(self, satirlar, ek_bilgi):
-        """Excel'de bir bant tek kişidir: banttan TEK satır bırakılır.
-
-        Kartın arka yüzü nadiren kart olarak da tespit edilebiliyor ve boş bir
-        ikinci satır üretiyordu. En çok alanı okunan satır tutulur; ad/soyad
-        eksikse Excel'in kendi yazdığı isimden tamamlanır, okunduysa onunla
-        karşılaştırılır."""
-        if not satirlar:
-            return satirlar
-
-        def dolu_alan(satir):
-            return sum(
-                1 for alan in ("Kimlik No", "Ad", "Soyad")
-                if str(satir.get(alan, "")).strip() not in ("", "Bulunamadi")
-            )
-
-        satir = max(satirlar, key=dolu_alan)
-        satir["Kart"] = "1/1" if satir.get("_kart_bulundu") else "-"
-
-        excel_adi = (ek_bilgi or {}).get("excel_adi") or ""
-        excelden = []
-        ad_uyusmazligi = ""
-
-        if excel_adi:
-            e_ad, e_soyad = excel_kaynak.adi_ayir(excel_adi)
-            if str(satir.get("Ad")) == "Bulunamadi" and e_ad:
-                satir["Ad"] = e_ad
-                excelden.append("Ad")
-            if str(satir.get("Soyad")) == "Bulunamadi" and e_soyad:
-                satir["Soyad"] = e_soyad
-                excelden.append("Soyad")
-            if not excelden:
-                okunan = normalize_text(f"{satir.get('Ad')} {satir.get('Soyad')}")
-                if benzerlik(okunan, normalize_text(excel_adi)) < AD_BENZERLIK_ESIGI:
-                    ad_uyusmazligi = excel_adi
-
-        satir["_excelden_alanlar"] = excelden
-        satir["_ad_uyusmazligi"] = bool(ad_uyusmazligi)
-        if excelden:
-            satir["_kart_bulundu"] = True
-
-        # Durum, tamamlanan alanlardan sonra yeniden yazılıyor.
-        eksikler = [
-            alan for alan in ("Kimlik No", "Ad", "Soyad")
-            if str(satir.get(alan, "")).strip() in ("", "Bulunamadi")
-        ]
-        if satir.get("_hata") and not satir.get("_kart_bulundu"):
-            durum = str(satir["_hata"])
-        elif eksikler:
-            durum = "Eksik alan: " + ", ".join(eksikler)
-        elif satir.get("_tc_supheli"):
-            durum = "Kimlik No doğrulanamadı — kontrol edin"
-        else:
-            durum = "Başarılı"
-        if excelden:
-            durum += f" ({'/'.join(excelden)} Excel'den alındı)"
-        if ad_uyusmazligi:
-            durum += f" — Excel'de: {ad_uyusmazligi}"
-        satir["Durum"] = durum
-
-        return [satir]
-
-    def _kurtarma_satirlari(self, yol, sayfa_no, resim, bolgeler, mevcut_satirlar):
-        """Tespitin kart çıkaramadığı blokları doğrudan OCR'lar.
-
-        Kimlik kartı hizalanamadığında eskiden o kimlik tamamen kayboluyordu.
-        Burada blok kırpılıp büyütülüyor ve normal alan okuma akışından
-        geçiriliyor; GEÇERLİ (checksum'ı tutan) bir kimlik numarası çıkarsa
-        satır olarak ekleniyor.
-
-        Kartın arka yüzü de kart büyüklüğünde bir bloktur ve MRZ'sinde aynı
-        numara yazar; o yüzden sayfada ZATEN görülmüş numaralar atlanıyor —
-        arka yüzler kendiliğinden elenmiş oluyor."""
-        gorulen_tcler = {
-            str(r.get("Kimlik No", "")).strip()
-            for r in mevcut_satirlar
-            if str(r.get("Kimlik No", "")).strip() not in ("", "Bulunamadi")
-        }
-
-        satirlar = []
-        for x0, y0, x1, y1 in list(bolgeler)[:KURTARMA_AZAMI_BOLGE]:
-            if self._durduruldu:
-                break
-
-            baslangic = time.perf_counter()
-            blok = resim[int(y0):int(y1), int(x0):int(x1)]
-            if blok is None or blok.size == 0 or blok.shape[0] < 2 or blok.shape[1] < 2:
-                continue
-
-            # OCR, düzeltilmiş kart boyutlarında eğitilmiş oranlara göre
-            # çalışıyor; küçük bloğu o ölçeğe büyütüyoruz.
-            if blok.shape[1] < KURTARMA_HEDEF_GENISLIK:
-                olcek = KURTARMA_HEDEF_GENISLIK / float(blok.shape[1])
-                blok = cv2.resize(blok, None, fx=olcek, fy=olcek, interpolation=cv2.INTER_CUBIC)
-            blok = np.ascontiguousarray(blok)
-
-            try:
-                ocr_sonuc = bilgileri_cimbizla(
-                    blok, sayfa_no=sayfa_no, debug=self.debug, belge_tipi="tc",
-                    derin=self.derin,
-                )
-            except Exception:
-                continue
-
-            kimlik_no = str(ocr_sonuc.get("tc_no", "Bulunamadi")).strip()
-            if kimlik_no in ("", "Bulunamadi") or kimlik_no in gorulen_tcler:
-                continue
-            # Kurtarmada yalnız doğrulanmış numaraya güveniyoruz; hizalanmamış
-            # bloktan gelen şüpheli okuma yanlış kişi kaydı üretebilir.
-            if not ocr_sonuc.get("tc_dogrulandi", True):
-                continue
-            gorulen_tcler.add(kimlik_no)
-
-            ad = ocr_sonuc.get("ad", "Bulunamadi")
-            soyad = ocr_sonuc.get("soyad", "Bulunamadi")
-
-            eksikler = [
-                alan for alan, deger in (("Ad", ad), ("Soyad", soyad))
-                if deger == "Bulunamadi"
-            ]
-            durum = "Kart hizalanamadı, sayfadan okundu"
-            if eksikler:
-                durum += " — eksik alan: " + ", ".join(eksikler)
-
-            satirlar.append({
-                "Dosya": os.path.basename(yol),
-                "Sayfa": sayfa_no if sayfa_no is not None else "-",
-                "Kart": "K",
-                "Belge Türü": "T.C. Kimlik",
-                "Kimlik No": kimlik_no,
-                "Ad": ad,
-                "Soyad": soyad,
-                "Bitiş Tarihi": "-",
-                "Geçerlilik": "-",
-                "Durum": durum,
-                "Süre": round(time.perf_counter() - baslangic, 2),
-                "_belge_tipi": "tc",
-                "_belge_gecerli": None,
-                "_kart_bulundu": True,
-                "_kurtarildi": True,
-                "_kaynak_yol": yol,
-                "_koseler": [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
-                "_ad_conf": float(ocr_sonuc.get("ad_conf", 0.0) or 0.0),
-                "_soyad_conf": float(ocr_sonuc.get("soyad_conf", 0.0) or 0.0),
-                "_preview": blok,
-                "_debug_resmi": ocr_sonuc.get("debug_resmi"),
-                "_kart_debug": None,
-                "_kart_sonuc": {
-                    "belge_tipi": "tc",
-                    "mesaj": "Kart tespit edilemedi; blok doğrudan okundu (kurtarma).",
-                    "arama_modu": "kurtarma",
-                    "referans_hatalari": {},
-                },
-                "_ocr_sonuc": {
-                    "guven": ocr_sonuc.get("guven"),
-                    "kimlik_no_conf": ocr_sonuc.get("kimlik_no_conf", 0.0),
-                    "ad_conf": ocr_sonuc.get("ad_conf", 0.0),
-                    "soyad_conf": ocr_sonuc.get("soyad_conf", 0.0),
-                    "ocr_suresi": ocr_sonuc.get("ocr_suresi", 0.0),
-                    "tum_ocr": ocr_sonuc.get("tum_ocr", []) if self.debug else [],
-                },
-            })
-
-        return satirlar
-
-    def _satir_olustur(self, yol, sayfa_no, resim, kart_sonuc, sira, kart_sayisi,
-                       tespit_hatasi, ek_sure, ek_bilgi=None):
-        """Tek bir kimlik (sayfadaki bir kart) için OCR'ı çalıştırıp tablo
-        satırını üretir. Sayfada hiç kart bulunamadıysa da tek bir
-        "bulunamadı" satırı üretilir."""
-        baslangic = time.perf_counter()
-
-        hata = tespit_hatasi
-        belge_tipi = "bilinmiyor"
-        kart = None
-        ocr_sonuc = {}
-
-        if kart_sonuc.get("basarili", False):
-            kart = kart_sonuc.get("kart")
-            belge_tipi = kart_sonuc.get("belge_tipi", "tc")
-        else:
-            eslesen = kart_sonuc.get("belge_tipi")
-            if eslesen in {"tc", "eski_tc", "gocmen"}:
-                belge_tipi = eslesen
-            if not hata and kart_sonuc:
-                hata = kart_sonuc.get("mesaj") or "Kart tespit edilemedi."
-
-        # Streamlit backend'indeki kritik bağlantı:
-        # OCR yalnızca tespit edilen/düzeltilen kart üzerinde ve belge_tipi ile çalışır.
-        if kart is not None:
-            try:
-                ocr_sonuc = bilgileri_cimbizla(
-                    kart,
-                    sayfa_no=sayfa_no,
-                    debug=self.debug,
-                    belge_tipi=belge_tipi,
-                    derin=self.derin,
-                )
-                if ocr_sonuc.get("hata"):
-                    hata = str(ocr_sonuc["hata"])
-            except Exception as e:
-                hata = f"OCR hatası: {e}"
-
-        kimlik_no = ocr_sonuc.get("tc_no", "Bulunamadi")
-        ad = ocr_sonuc.get("ad", "Bulunamadi")
-        soyad = ocr_sonuc.get("soyad", "Bulunamadi")
-        bitis = ocr_sonuc.get("bitis_tarihi", "")
-        belge_gecerli = ocr_sonuc.get("belge_gecerli")
-        ad_conf = float(ocr_sonuc.get("ad_conf", 0.0) or 0.0)
-        soyad_conf = float(ocr_sonuc.get("soyad_conf", 0.0) or 0.0)
-
-        # Numara okundu ama checksum'ı tutmuyor: kaybetmek yerine
-        # "doğrulanamadı" diye gösteriyoruz, kullanıcı karta bakıp düzeltebilsin.
-        tc_dogrulandi = bool(ocr_sonuc.get("tc_dogrulandi", True))
-        tc_supheli = kimlik_no != "Bulunamadi" and not tc_dogrulandi
-
-        excel_adi = (ek_bilgi or {}).get("excel_adi") or ""
-
-        eksikler = []
-        if kart is None:
-            eksikler.append("Kimlik")
-        else:
-            if kimlik_no == "Bulunamadi":
-                eksikler.append("Kimlik No")
-            if ad == "Bulunamadi":
-                eksikler.append("Ad")
-            if soyad == "Bulunamadi":
-                eksikler.append("Soyad")
-            if belge_tipi == "gocmen" and not bitis:
-                eksikler.append("Bitiş Tarihi")
-
-        if hata:
-            durum = hata
-        elif eksikler:
-            durum = "Eksik alan: " + ", ".join(eksikler)
-        elif tc_supheli:
-            durum = "Kimlik No doğrulanamadı — kontrol edin"
-        else:
-            durum = "Başarılı"
-
-        if tc_supheli and eksikler:
-            durum += " (Kimlik No doğrulanamadı)"
-
-        belge_yazi = {
-            "tc": "T.C. Kimlik",
-            "eski_tc": "Eski T.C. Kimlik",
-            "gocmen": "Göçmen / Yabancı",
-        }.get(belge_tipi, "Bilinmiyor")
-
-        if belge_tipi == "gocmen":
-            if belge_gecerli is False:
-                gecerlilik = "GEÇERSİZ"
-            elif belge_gecerli is True:
-                gecerlilik = "Geçerli"
-            else:
-                gecerlilik = "Kontrol Edilemedi"
-        else:
-            gecerlilik = "-"
-
-        return {
-            "Dosya": os.path.basename(yol),
-            "Sayfa": sayfa_no if sayfa_no is not None else "-",
-            "Kart": f"{sira}/{kart_sayisi}" if kart_sayisi else "-",
-            "Belge Türü": belge_yazi,
-            "Kimlik No": kimlik_no,
-            "Ad": ad,
-            "Soyad": soyad,
-            "Bitiş Tarihi": bitis if belge_tipi == "gocmen" else "-",
-            "Geçerlilik": gecerlilik,
-            "Durum": durum,
-            "Süre": round(time.perf_counter() - baslangic + ek_sure, 2),
-            "_belge_tipi": belge_tipi,
-            "_belge_gecerli": belge_gecerli,
-            "_kart_bulundu": kart is not None,
-            "_tc_supheli": tc_supheli,
-            "_excel_adi": excel_adi,
-            "_hata": hata,
-            # Sayfanın tamamını işaretli göstermek için: kaynak dosya + kartın
-            # sayfa üzerindeki köşeleri. Sayfa görüntüsü saklanmıyor, gerektiğinde
-            # dosyadan yeniden üretiliyor (yüzlerce sayfada bellek şişmesin).
-            "_kaynak_yol": yol,
-            "_koseler": (kart_sonuc.get("koseler").tolist()
-                         if kart_sonuc.get("koseler") is not None else None),
-            "_ad_conf": ad_conf,
-            "_soyad_conf": soyad_conf,
-            "_preview": kart if kart is not None else resim,
-            "_debug_resmi": ocr_sonuc.get("debug_resmi"),
-            "_kart_debug": kart_sonuc.get("debug_resmi"),
-            "_kart_sonuc": {
-                "belge_tipi": kart_sonuc.get("belge_tipi"),
-                "kart_sirasi": kart_sonuc.get("kart_sirasi", sira),
-                "kart_sayisi": kart_sonuc.get("kart_sayisi", kart_sayisi),
-                "arama_modu": kart_sonuc.get("arama_modu"),
-                "duzeltildi": kart_sonuc.get("duzeltildi", False),
-                "duzeltme_yontemi": kart_sonuc.get("duzeltme_yontemi"),
-                "fallback": kart_sonuc.get("fallback", False),
-                "iyi_eslesme": kart_sonuc.get("iyi_eslesme", 0),
-                "inlier": kart_sonuc.get("inlier", 0),
-                "inlier_orani": kart_sonuc.get("inlier_orani", 0.0),
-                "skor": kart_sonuc.get("skor", 0.0),
-                "mesaj": kart_sonuc.get("mesaj", ""),
-                "aday_sirasi": kart_sonuc.get("aday_sirasi"),
-                "referans_hatalari": kart_sonuc.get("referans_hatalari", {}),
-            },
-            "_ocr_sonuc": {
-                "guven": ocr_sonuc.get("guven"),
-                "tc_dogrulandi": tc_dogrulandi,
-                "tc_kaynak": ocr_sonuc.get("tc_kaynak"),
-                "kimlik_no_conf": ocr_sonuc.get("kimlik_no_conf", 0.0),
-                "ad_conf": ocr_sonuc.get("ad_conf", 0.0),
-                "soyad_conf": ocr_sonuc.get("soyad_conf", 0.0),
-                "baslangic_tarihi": ocr_sonuc.get("baslangic_tarihi", ""),
-                "bitis_tarihi": ocr_sonuc.get("bitis_tarihi", ""),
-                "gecerlilik_durumu": ocr_sonuc.get("gecerlilik_durumu"),
-                "ocr_suresi": ocr_sonuc.get("ocr_suresi", 0.0),
-                "hizli_yol_kullanildi": ocr_sonuc.get("hizli_yol_kullanildi"),
-                "hizli_hucre_ocr_suresi": ocr_sonuc.get("hizli_hucre_ocr_suresi", 0.0),
-                "detector_fallback_kullanildi": ocr_sonuc.get("detector_fallback_kullanildi"),
-                "detector_ocr_suresi": ocr_sonuc.get("detector_ocr_suresi", 0.0),
-                "fallback_denenen_alanlar": ocr_sonuc.get("fallback_denenen_alanlar", []),
-                "fallback_kullanilan_alanlar": ocr_sonuc.get("fallback_kullanilan_alanlar", []),
-                "fallback_ocr_suresi": ocr_sonuc.get("fallback_ocr_suresi", 0.0),
-                "tum_ocr": ocr_sonuc.get("tum_ocr", []) if self.debug else [],
-            },
-        }
 
 
 class MainWindow(QMainWindow):
@@ -1168,155 +98,7 @@ class MainWindow(QMainWindow):
         self.edit_mode = False
         self._table_updating = False
 
-        self.setStyleSheet("""
-            QMainWindow, QWidget {
-                background-color: #17191c;
-                color: #f3f4f6;
-            }
-
-            QLabel {
-                color: #f3f4f6;
-                font-size: 14px;
-            }
-
-            QPushButton {
-                color: #f8fafc;
-                background-color: #2b2f34;
-                border: 1px solid #4a5058;
-                border-radius: 8px;
-                padding: 8px 14px;
-                min-height: 38px;
-                font-size: 14px;
-                font-weight: 600;
-            }
-
-            QPushButton:hover {
-                background-color: #363b42;
-                border-color: #68707a;
-            }
-
-            QPushButton:pressed {
-                background-color: #22262b;
-            }
-
-            QPushButton:disabled {
-                color: #777d86;
-                background-color: #222529;
-                border-color: #34383e;
-            }
-
-            QPushButton:checked {
-                background-color: #3a4149;
-                border: 2px solid #aeb7c2;
-            }
-
-            QCheckBox {
-                color: #f3f4f6;
-                font-size: 14px;
-                spacing: 8px;
-            }
-
-            QCheckBox:disabled {
-                color: #777d86;
-            }
-
-            QTableWidget {
-                color: #f3f4f6;
-                background-color: #1e2125;
-                alternate-background-color: #24282d;
-                gridline-color: #3a3f46;
-                border: 1px solid #3d4249;
-                font-size: 13px;
-                selection-background-color: #3d4652;
-                selection-color: #ffffff;
-            }
-
-            QTableWidget::item {
-                padding: 5px;
-            }
-
-            QHeaderView::section {
-                color: #ffffff;
-                background-color: #30343a;
-                border: 0px;
-                border-right: 1px solid #474c54;
-                border-bottom: 1px solid #474c54;
-                padding: 8px 6px;
-                font-size: 13px;
-                font-weight: 700;
-            }
-
-            QTableCornerButton::section {
-                background-color: #30343a;
-                border: 1px solid #474c54;
-            }
-
-            QProgressBar {
-                color: #ffffff;
-                background-color: #24282d;
-                border: 1px solid #444a52;
-                border-radius: 6px;
-                min-height: 22px;
-                text-align: center;
-                font-size: 12px;
-            }
-
-            QProgressBar::chunk {
-                background-color: #7d8794;
-                border-radius: 5px;
-            }
-
-            QTextEdit {
-                color: #f1f5f9;
-                background-color: #111316;
-                border: 1px solid #454b53;
-                border-radius: 7px;
-                padding: 8px;
-                font-family: Consolas, "Courier New", monospace;
-                font-size: 13px;
-            }
-
-            QScrollArea {
-                background-color: #111316;
-                border: none;
-            }
-
-            QScrollBar:vertical {
-                background: #1e2125;
-                width: 13px;
-                margin: 0;
-            }
-
-            QScrollBar::handle:vertical {
-                background: #555d67;
-                min-height: 30px;
-                border-radius: 6px;
-            }
-
-            QScrollBar:horizontal {
-                background: #1e2125;
-                height: 13px;
-                margin: 0;
-            }
-
-            QScrollBar::handle:horizontal {
-                background: #555d67;
-                min-width: 30px;
-                border-radius: 6px;
-            }
-
-            QSplitter::handle {
-                background-color: #4b5159;
-            }
-
-            QSplitter::handle:horizontal {
-                width: 5px;
-            }
-
-            QSplitter::handle:vertical {
-                height: 5px;
-            }
-        """)
+        self.setStyleSheet(KOYU_TEMA)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -1346,38 +128,19 @@ class MainWindow(QMainWindow):
         self.edit_btn.setCheckable(True)
         self.edit_btn.setEnabled(False)
 
-        # Tespitin kaçırdığı bir kimliği elle eklemek / fazladan satırı silmek için.
-        self.satir_ekle_btn = QPushButton("＋ Satır")
-        self.satir_ekle_btn.setToolTip(
-            "Seçili satırın sayfasına, elle doldurulacak boş bir kimlik satırı ekler."
-        )
-        self.satir_sil_btn = QPushButton("－ Satır")
-        self.satir_sil_btn.setToolTip("Seçili satırı listeden siler.")
-        self.satir_ekle_btn.setEnabled(False)
-        self.satir_sil_btn.setEnabled(False)
-
+        # Bu üç seçenek artık arayüzde gösterilmiyor — davranışları her zaman
+        # açık kabul ediliyor (çok kimlikli sayfa taraması, derin okuma,
+        # kurtarma). Widget'lar yine de oluşturuluyor (checked=True) ve
+        # layout'a eklenmiyor: kod tabanının geri kalanı hâlâ
+        # `self.X_cb.isChecked()` üzerinden okuyor, tek değişen bunların
+        # artık kullanıcıya görünmemesi.
         self.coklu_cb = QCheckBox("Çok kimlikli sayfa")
         self.coklu_cb.setChecked(True)
-        self.coklu_cb.setToolTip(
-            "Açıkken sayfanın tamamı taranır ve satır seçilince sayfa, bulunan\n"
-            "kimlikler işaretli halde gösterilir. Her sayfada tek kimlik olduğu\n"
-            "biliniyorsa kapatmak işlemi hızlandırır."
-        )
-
         self.derin_cb = QCheckBox("Derin okuma")
         self.derin_cb.setChecked(True)
-        self.derin_cb.setToolTip(
-            "Kimlik numarası ilk denemede okunamazsa ek okuma geçişleri yapar. "
-            "Solgun fotokopilerde okunan numara sayısını belirgin arttırır; "
-            "kapatılırsa işlem yaklaşık üçte bir oranında hızlanır."
-        )
-
         self.kurtar_cb = QCheckBox("Kurtarma")
         self.kurtar_cb.setChecked(True)
-        self.kurtar_cb.setToolTip(
-            "Kart olarak hizalanamayan blokları da doğrudan okur; kimliğin sessizce "
-            "atlanmasını önler. Kapatılırsa işlem bir miktar hızlanır."
-        )
+
         self.debug_cb = QCheckBox("Debug")
         self.debug_cb.setToolTip("Seçilen satırın belge tespit / OCR ayrıntılarını gösterir.")
 
@@ -1388,13 +151,8 @@ class MainWindow(QMainWindow):
             self.gecmis_btn,
             self.karsilastir_btn,
             self.edit_btn,
-            self.satir_ekle_btn,
-            self.satir_sil_btn,
         ):
             btn.setMinimumHeight(42)
-
-        for btn in (self.satir_ekle_btn, self.satir_sil_btn):
-            btn.setMaximumWidth(110)
 
         ust.addWidget(self.sec_btn)
         ust.addWidget(self.klasor_btn)
@@ -1402,12 +160,7 @@ class MainWindow(QMainWindow):
         ust.addWidget(self.gecmis_btn)
         ust.addWidget(self.karsilastir_btn)
         ust.addWidget(self.edit_btn)
-        ust.addWidget(self.satir_ekle_btn)
-        ust.addWidget(self.satir_sil_btn)
         ust.addStretch(1)
-        ust.addWidget(self.coklu_cb)
-        ust.addWidget(self.derin_cb)
-        ust.addWidget(self.kurtar_cb)
         ust.addWidget(self.debug_cb)
         ana.addLayout(ust)
 
@@ -1583,8 +336,6 @@ class MainWindow(QMainWindow):
         self.pdf_btn.clicked.connect(self.pdf_kaydet)
         self.gecmis_btn.clicked.connect(self.gecmisi_goster)
         self.karsilastir_btn.clicked.connect(self.listeyle_karsilastir)
-        self.satir_ekle_btn.clicked.connect(self.elle_satir_ekle)
-        self.satir_sil_btn.clicked.connect(self.satiri_sil)
         self.zoom_arttir_btn.clicked.connect(lambda: self.zoom_degistir(1.25))
         self.zoom_azalt_btn.clicked.connect(lambda: self.zoom_degistir(0.8))
         self.zoom_sigdir_btn.clicked.connect(self.zoom_sigdir)
@@ -1636,8 +387,6 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.debug_text.clear()
 
-        self.satir_ekle_btn.setEnabled(False)
-        self.satir_sil_btn.setEnabled(False)
         self._sayfa_onbellek = {}
 
         self.worker = Worker(
@@ -1829,8 +578,6 @@ class MainWindow(QMainWindow):
         self.excel_btn.setEnabled(bool(sonuclar))
         self.pdf_btn.setEnabled(bool(sonuclar))
         self.edit_btn.setEnabled(bool(sonuclar))
-        self.satir_ekle_btn.setEnabled(bool(sonuclar))
-        self.satir_sil_btn.setEnabled(bool(sonuclar))
         self.karsilastir_btn.setEnabled(bool(sonuclar))
         self.canli_sonuclar = list(sonuclar)
 
@@ -1914,8 +661,27 @@ class MainWindow(QMainWindow):
         sonuc = karsilastirma.karsilastir(self.sonuclar, kayitlar)
         self.bilgi.setText(karsilastirma.ozet_metni(sonuc, os.path.basename(yol)))
 
-        pencere = KarsilastirmaPenceresi(sonuc, bilgi, os.path.basename(yol), self)
-        pencere.exec()
+        # Modal DEĞİL: kullanıcı bu pencere açıkken ana tabloda gezinebilsin.
+        # Referansı sakla — yoksa show() sonrası nesne çöp toplanır ve pencere
+        # hemen kapanır.
+        self.karsilastirma_penceresi = KarsilastirmaPenceresi(
+            sonuc, bilgi, os.path.basename(yol), self
+        )
+        self.karsilastirma_penceresi.show()
+        self.karsilastirma_penceresi.raise_()
+        self.karsilastirma_penceresi.activateWindow()
+
+    def satiri_sec_ve_goster(self, satir):
+        """Karşılaştırma penceresinden çağrılır: ana tabloda o satırı seçer,
+        pencereyi öne getirir ve önizlemeyi gösterir."""
+        try:
+            r = next(i for i, s in enumerate(self.sonuclar) if s is satir)
+        except StopIteration:
+            return
+        self.raise_()
+        self.activateWindow()
+        self.table.selectRow(r)
+        self.table.scrollToItem(self.table.item(r, 0))
 
     def gecmisi_goster(self):
         pencere = GecmisPenceresi(self)
@@ -1960,8 +726,6 @@ class MainWindow(QMainWindow):
         self.excel_btn.setEnabled(bool(satirlar))
         self.pdf_btn.setEnabled(bool(satirlar))
         self.edit_btn.setEnabled(bool(satirlar))
-        self.satir_ekle_btn.setEnabled(bool(satirlar))
-        self.satir_sil_btn.setEnabled(bool(satirlar))
         self.karsilastir_btn.setEnabled(bool(satirlar))
         if self.table.rowCount():
             self.table.selectRow(0)
@@ -2051,31 +815,40 @@ class MainWindow(QMainWindow):
     def onizleme_gorselleri(self, sonuc):
         """(gösterilecek görüntü, işaretsiz görüntü, sayfadaki ofset) üçlüsü.
 
-        İkisi de AYNI kırpmadan gelir: ekranda işaretli hali görünür, fareyle
-        seçilen alan ise işaretsiz halden kırpılır (yeşil çerçeveler OCR'a
-        karışmasın). Ofset, seçimi tekrar sayfa koordinatına çevirmek için."""
-        if self.coklu_cb.isChecked():
+        "kart" kipinde (bir satıra tıklandığında) kartın PERSPEKTİFİ
+        DÜZELTİLMİŞ, düz hali (_preview) gösterilir — sayfadan kırpma
+        yapılmaz, komşu kartlar veya kâğıdın eğikliği görünmez. "sayfa"
+        kipinde (Sayfa sütununa tıklandığında) sayfanın tamamı, bulunan
+        kartlar işaretli halde gösterilir; fareyle seçilen alan bu işaretsiz
+        sayfadan kırpılır (yeşil çerçeveler OCR'a karışmasın)."""
+        if self.coklu_cb.isChecked() and self._onizleme_kipi == "kart":
+            duz = sonuc.get("_preview")
+            if duz is not None:
+                return duz, duz, (0, 0)
+
+            # Kart hizalanamadı (kurtarma/elle açılmış boş satır gibi):
+            # elimizde düz bir görüntü yok, sayfadan kimliğin çevresini
+            # kırpıp gösteriyoruz — bu durumda seçim yine sayfa koordinatında.
+            sayfa = self.sayfa_goruntusu_getir(sonuc.get("_kaynak_yol"), sonuc.get("Sayfa"))
+            if sayfa is not None and sonuc.get("_koseler"):
+                kirpma, ofset = self.karta_yakinlas(sayfa, sonuc["_koseler"])
+                return kirpma, kirpma, ofset
+            if sayfa is not None:
+                return sayfa, sayfa, (0, 0)
+
+        elif self.coklu_cb.isChecked():   # "sayfa" kipi: tüm sayfa, işaretli
             sayfa = self.sayfa_goruntusu_getir(
                 sonuc.get("_kaynak_yol"), sonuc.get("Sayfa")
             )
             if sayfa is not None:
                 satirlar = self.sayfanin_satirlari(sonuc)
                 anahtar = (sonuc.get("_kaynak_yol"), sonuc.get("Sayfa"), id(sonuc),
-                           tuple(id(r) for r in satirlar), self._onizleme_kipi)
+                           tuple(id(r) for r in satirlar))
                 if self._isaretli_onbellek[0] == anahtar:
                     return self._isaretli_onbellek[1]
 
                 isaretli = self.sayfayi_isaretle(sayfa, satirlar, sonuc)
-                ham = sayfa
-                ofset = (0, 0)
-
-                # Satıra tıklanmışsa o kimliğe yakınlaş; Sayfa sütununa
-                # tıklanmışsa sayfanın tamamı kalsın.
-                if self._onizleme_kipi == "kart" and sonuc.get("_koseler"):
-                    isaretli, ofset = self.karta_yakinlas(isaretli, sonuc["_koseler"])
-                    ham, _ = self.karta_yakinlas(sayfa, sonuc["_koseler"])
-
-                gorseller = (isaretli, ham, ofset)
+                gorseller = (isaretli, sayfa, (0, 0))
                 self._isaretli_onbellek = (anahtar, gorseller)
                 return gorseller
 
@@ -2119,17 +892,27 @@ class MainWindow(QMainWindow):
         if notlar:
             metin += " (" + ", ".join(notlar) + ")"
 
-        if self._onizleme_kipi == "kart" and sonuc.get("_koseler"):
+        kart_kipi = self._onizleme_kipi == "kart"
+        if kart_kipi and sonuc.get("_preview") is not None:
+            metin += "  •  düzeltilmiş kart"
+        elif kart_kipi and sonuc.get("_koseler"):
             metin += "  •  yakınlaştırıldı"
+
         self._sayfa_bilgi_metni = metin
-        self._onizleme_ipucu_metni = (
-            "Sayfanın tamamı için Sayfa sütununa tıklayın.  "
-            "İşaretlenmemiş kimliği fareyle çerçeveleyip “Seçili alanı oku” ile okutun."
-        )
+        if kart_kipi and sonuc.get("_preview") is not None:
+            # Bu görünümde alan seçimi kapalı (koordinat sayfaya değil kartın
+            # kendi pikseline ait olurdu); ipucu buna göre kısaltılıyor.
+            self._onizleme_ipucu_metni = "Sayfanın tamamı için Sayfa sütununa tıklayın."
+        else:
+            self._onizleme_ipucu_metni = (
+                "Sayfanın tamamı için Sayfa sütununa tıklayın.  "
+                "İşaretlenmemiş kimliği fareyle çerçeveleyip “Seçili alanı oku” ile okutun."
+            )
         self.onizleme_yazilarini_tazele()
 
-    def pixmapi_yerlestir(self, img, ham=None, ofset=(0, 0)):
+    def pixmapi_yerlestir(self, img, ham=None, ofset=(0, 0), secim_acik=True):
         self.preview.secimi_temizle()
+        self.preview.secim_acik = secim_acik
         self._secim = None
         self.alan_oku_btn.setEnabled(False)
         self._onizleme_ham = ham if ham is not None else img
@@ -2337,87 +1120,6 @@ class MainWindow(QMainWindow):
             return True
         return super().eventFilter(nesne, olay)
 
-    def elle_satir_ekle(self):
-        """Tespitin kaçırdığı bir kimliği elle girmek için boş satır açar."""
-        if not self.sonuclar:
-            return
-
-        r = self.table.currentRow()
-        if r < 0:
-            r = len(self.sonuclar) - 1
-        kaynak = self.sonuclar[r]
-
-        yeni = {
-            "Dosya": kaynak.get("Dosya", ""),
-            "Sayfa": kaynak.get("Sayfa", "-"),
-            "Kart": "elle",
-            "Belge Türü": kaynak.get("Belge Türü", "T.C. Kimlik"),
-            "Kimlik No": "",
-            "Ad": "",
-            "Soyad": "",
-            "Bitiş Tarihi": "-",
-            "Geçerlilik": "-",
-            "Durum": "Elle eklendi — alanları doldurun",
-            "Süre": 0.0,
-            "_belge_tipi": kaynak.get("_belge_tipi", "tc"),
-            "_belge_gecerli": None,
-            "_kart_bulundu": True,
-            "_manuel_eklendi": True,
-            "_kaynak_yol": kaynak.get("_kaynak_yol"),
-            "_koseler": None,
-            # Konumu yok; sıralamada seçili satırın hemen ardında dursun.
-            "_ardil_oldugu": id(kaynak),
-            "_preview": None,
-            "_kart_sonuc": {},
-            "_ocr_sonuc": {},
-        }
-
-        self.sonuclar.insert(r + 1, yeni)
-        self.sayfalari_duzenle()
-
-        # Elle satır girilecek: düzenleme modunu kendiliğinden aç.
-        if not self.edit_mode:
-            self.edit_btn.setChecked(True)
-
-        self.tabloyu_yenile(secilecek=yeni)
-        self.table.editItem(
-            self.table.item(self.table.currentRow(), self.headers.index("Kimlik No"))
-        )
-        self.ozet_guncelle(self.sonuclar)
-        self.gecmisi_guncellemeyi_planla()
-
-    def satiri_sil(self):
-        r = self.table.currentRow()
-        if r < 0 or r >= len(self.sonuclar):
-            return
-
-        satir = self.sonuclar[r]
-        cevap = QMessageBox.question(
-            self,
-            "Satırı sil",
-            f"{satir.get('Dosya')} / sayfa {satir.get('Sayfa')} satırı silinsin mi?\n"
-            f"Kimlik No: {satir.get('Kimlik No')}",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if cevap != QMessageBox.Yes:
-            return
-
-        self.sonuclar.pop(r)
-        # Silinen kimlikten sonrakilerin numarası kaysın.
-        self.sayfalari_duzenle()
-        self.tabloyu_yenile()
-
-        self.ozet_guncelle(self.sonuclar)
-        self.gecmisi_guncellemeyi_planla()
-        if self.table.rowCount():
-            self.table.selectRow(min(r, self.table.rowCount() - 1))
-        else:
-            self.preview.clear()
-            self._sayfa_bilgi_metni = ""
-            self._onizleme_ipucu_metni = ""
-            self.onizleme_yazilarini_tazele()
-
     def sayfa_satirlarini_sirala(self, satirlar):
         """Bir sayfanın satırlarını kimliğin sayfadaki YERİNE göre dizer:
         yukarıdan aşağıya, aynı hizadakiler soldan sağa. Konumu olmayan
@@ -2580,7 +1282,15 @@ class MainWindow(QMainWindow):
         sonuc = self.sonuclar[r]
 
         gosterilecek, ham, ofset = self.onizleme_gorselleri(sonuc)
-        self.pixmapi_yerlestir(gosterilecek, ham=ham, ofset=ofset)
+        # "kart" kipinde perspektifi düzeltilmiş kartın kendisi gösteriliyor;
+        # üzerinde fareyle alan seçmenin bir anlamı yok (koordinat sayfaya
+        # değil kartın kendi pikseline ait olurdu) — o yüzden kapatılıyor.
+        secim_acik = not (
+            self.coklu_cb.isChecked()
+            and self._onizleme_kipi == "kart"
+            and sonuc.get("_preview") is not None
+        )
+        self.pixmapi_yerlestir(gosterilecek, ham=ham, ofset=ofset, secim_acik=secim_acik)
         self.sayfa_bilgisini_guncelle(sonuc)
 
         if not self.debug_cb.isChecked():
