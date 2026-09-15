@@ -898,9 +898,18 @@ def eski_tc_bilgilerini_oku(kart, sayfa_no=None, debug=False):
             (ad_item, "AD", (255, 255, 0)),
         ])
 
+    # tc_no, checksum kontrolsüz bir fallback'ten (TC etiketine en yakın 11
+    # haneli herhangi bir rakam dizisi) gelmiş olabilir. bilgileri_cimbizla
+    # bu alan yoksa "tc_no okundu mu" diye bakıp doğrulanmış sayıyordu — hâlbuki
+    # okunmuş olmak checksum'ın tuttuğu anlamına gelmiyor. Burada gerçek
+    # checksum sonucu bildiriliyor ki tutmayan numara sarı işaretlenebilsin.
+    tc_dogrulandi = tc_no != "Bulunamadi" and tc_kimlik_gecerli_mi(tc_no)
+
     return {
         "sayfa_no": sayfa_no, "belge_tipi": "eski_tc", "tc_no": tc_no, "ad": ad, "soyad": soyad,
         "guven": guven, "kimlik_no_conf": kimlik_no_conf, "ad_conf": ad_conf, "soyad_conf": soyad_conf,
+        "tc_dogrulandi": tc_dogrulandi,
+        "tc_kaynak": "ilk" if tc_dogrulandi else ("dogrulanmadi" if tc_no != "Bulunamadi" else None),
         "baslangic_tarihi": "", "bitis_tarihi": "", "belge_gecerli": None, "gecerlilik_durumu": None,
         "debug_resmi": debug_resmi, "tum_ocr": ocr if debug else [],
         "ocr_suresi": sure + ad_sure + soyad_sure,

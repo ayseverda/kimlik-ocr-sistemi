@@ -15,8 +15,6 @@ Bu dosyada yalnizca MainWindow -- yani asil pencere/tablo/is akisi -- kaliyor.""
 
 import sys
 import os
-import time
-from datetime import datetime
 import tempfile
 
 import cv2
@@ -34,7 +32,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QLabel, QTableWidget, QTableWidgetItem,
     QProgressBar, QMessageBox, QCheckBox, QSplitter, QHeaderView,
     QAbstractItemView, QTextEdit, QScrollArea, QSizePolicy, QFrame,
-    QRubberBand, QDialog, QButtonGroup
+    QDialog
 )
 
 from goruntu_isleme import sayfa_sirasina_diz
@@ -128,6 +126,24 @@ class MainWindow(QMainWindow):
         self.edit_btn.setCheckable(True)
         self.edit_btn.setEnabled(False)
 
+        # Tespitin yanlış/eksik işaretlediği bir kimliği elle düzeltmek için:
+        # kaçırılan bir kimlik "Seçili alanı oku" ile zaten eklenebiliyor,
+        # ama YANLIŞ bir işaretlemeyi (örn. iki kart arasına düşmüş bozuk bir
+        # dörtgen) kaldırmanın tek yolu satırı silmek — silinen satır sayfa
+        # görünümünden de kalkar (işaretler her zaman güncel satır listesinden
+        # çiziliyor, bkz. sayfayi_isaretle).
+        self.satir_ekle_btn = QPushButton("＋ Satır")
+        self.satir_ekle_btn.setToolTip(
+            "Seçili satırın sayfasına, elle doldurulacak boş bir kimlik satırı ekler."
+        )
+        self.satir_sil_btn = QPushButton("－ Satır")
+        self.satir_sil_btn.setToolTip(
+            "Seçili satırı listeden siler — yanlış/hayalet bir tespit satırını "
+            "kaldırmak için de kullanılır; sayfadaki işareti de kalkar."
+        )
+        self.satir_ekle_btn.setEnabled(False)
+        self.satir_sil_btn.setEnabled(False)
+
         # Bu üç seçenek artık arayüzde gösterilmiyor — davranışları her zaman
         # açık kabul ediliyor (çok kimlikli sayfa taraması, derin okuma,
         # kurtarma). Widget'lar yine de oluşturuluyor (checked=True) ve
@@ -151,8 +167,13 @@ class MainWindow(QMainWindow):
             self.gecmis_btn,
             self.karsilastir_btn,
             self.edit_btn,
+            self.satir_ekle_btn,
+            self.satir_sil_btn,
         ):
             btn.setMinimumHeight(42)
+
+        for btn in (self.satir_ekle_btn, self.satir_sil_btn):
+            btn.setMaximumWidth(110)
 
         ust.addWidget(self.sec_btn)
         ust.addWidget(self.klasor_btn)
@@ -160,6 +181,8 @@ class MainWindow(QMainWindow):
         ust.addWidget(self.gecmis_btn)
         ust.addWidget(self.karsilastir_btn)
         ust.addWidget(self.edit_btn)
+        ust.addWidget(self.satir_ekle_btn)
+        ust.addWidget(self.satir_sil_btn)
         ust.addStretch(1)
         ust.addWidget(self.debug_cb)
         ana.addLayout(ust)
@@ -336,6 +359,8 @@ class MainWindow(QMainWindow):
         self.pdf_btn.clicked.connect(self.pdf_kaydet)
         self.gecmis_btn.clicked.connect(self.gecmisi_goster)
         self.karsilastir_btn.clicked.connect(self.listeyle_karsilastir)
+        self.satir_ekle_btn.clicked.connect(self.elle_satir_ekle)
+        self.satir_sil_btn.clicked.connect(self.satiri_sil)
         self.zoom_arttir_btn.clicked.connect(lambda: self.zoom_degistir(1.25))
         self.zoom_azalt_btn.clicked.connect(lambda: self.zoom_degistir(0.8))
         self.zoom_sigdir_btn.clicked.connect(self.zoom_sigdir)
@@ -384,6 +409,8 @@ class MainWindow(QMainWindow):
         self.edit_btn.setEnabled(False)
         self.baslat_btn.setEnabled(False)
         self.karsilastir_btn.setEnabled(False)
+        self.satir_ekle_btn.setEnabled(False)
+        self.satir_sil_btn.setEnabled(False)
         self.progress.setValue(0)
         self.debug_text.clear()
 
@@ -579,6 +606,8 @@ class MainWindow(QMainWindow):
         self.pdf_btn.setEnabled(bool(sonuclar))
         self.edit_btn.setEnabled(bool(sonuclar))
         self.karsilastir_btn.setEnabled(bool(sonuclar))
+        self.satir_ekle_btn.setEnabled(bool(sonuclar))
+        self.satir_sil_btn.setEnabled(bool(sonuclar))
         self.canli_sonuclar = list(sonuclar)
 
         # Bir sayfada birden fazla kimlik olabildiği için satır sayısı ile
@@ -727,6 +756,8 @@ class MainWindow(QMainWindow):
         self.pdf_btn.setEnabled(bool(satirlar))
         self.edit_btn.setEnabled(bool(satirlar))
         self.karsilastir_btn.setEnabled(bool(satirlar))
+        self.satir_ekle_btn.setEnabled(bool(satirlar))
+        self.satir_sil_btn.setEnabled(bool(satirlar))
         if self.table.rowCount():
             self.table.selectRow(0)
 
@@ -1119,6 +1150,94 @@ class MainWindow(QMainWindow):
             self.zoom_degistir(1.15 if olay.angleDelta().y() > 0 else 1 / 1.15)
             return True
         return super().eventFilter(nesne, olay)
+
+    def elle_satir_ekle(self):
+        """Tespitin kaçırdığı bir kimliği elle girmek için boş satır açar."""
+        if not self.sonuclar:
+            return
+
+        r = self.table.currentRow()
+        if r < 0:
+            r = len(self.sonuclar) - 1
+        kaynak = self.sonuclar[r]
+
+        yeni = {
+            "Dosya": kaynak.get("Dosya", ""),
+            "Sayfa": kaynak.get("Sayfa", "-"),
+            "Kart": "elle",
+            "Belge Türü": kaynak.get("Belge Türü", "T.C. Kimlik"),
+            "Kimlik No": "",
+            "Ad": "",
+            "Soyad": "",
+            "Bitiş Tarihi": "-",
+            "Geçerlilik": "-",
+            "Durum": "Elle eklendi — alanları doldurun",
+            "Süre": 0.0,
+            "_belge_tipi": kaynak.get("_belge_tipi", "tc"),
+            "_belge_gecerli": None,
+            "_kart_bulundu": True,
+            "_manuel_eklendi": True,
+            "_kaynak_yol": kaynak.get("_kaynak_yol"),
+            "_koseler": None,
+            # Konumu yok; sıralamada seçili satırın hemen ardında dursun.
+            "_ardil_oldugu": id(kaynak),
+            "_preview": None,
+            "_kart_sonuc": {},
+            "_ocr_sonuc": {},
+        }
+
+        self.sonuclar.insert(r + 1, yeni)
+        self.sayfalari_duzenle()
+
+        # Elle satır girilecek: düzenleme modunu kendiliğinden aç.
+        if not self.edit_mode:
+            self.edit_btn.setChecked(True)
+
+        self.tabloyu_yenile(secilecek=yeni)
+        self.table.editItem(
+            self.table.item(self.table.currentRow(), self.headers.index("Kimlik No"))
+        )
+        self.ozet_guncelle(self.sonuclar)
+        self.gecmisi_guncellemeyi_planla()
+
+    def satiri_sil(self):
+        """Seçili satırı listeden kaldırır.
+
+        Bu, tespitin yanlış işaretlediği bir satırı (ör. iki kart arasına
+        düşmüş bozuk bir dörtgen) temizlemenin de yoludur: satır
+        self.sonuclar'dan çıkınca, sayfa görünümündeki işareti de kalkar —
+        sayfayi_isaretle her zaman GÜNCEL satır listesinden çiziyor,
+        silinen satırın köşe koordinatları artık hiçbir yerde tutulmuyor."""
+        r = self.table.currentRow()
+        if r < 0 or r >= len(self.sonuclar):
+            return
+
+        satir = self.sonuclar[r]
+        cevap = QMessageBox.question(
+            self,
+            "Satırı sil",
+            f"{satir.get('Dosya')} / sayfa {satir.get('Sayfa')} satırı silinsin mi?\n"
+            f"Kimlik No: {satir.get('Kimlik No')}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if cevap != QMessageBox.Yes:
+            return
+
+        self.sonuclar.pop(r)
+        # Silinen kimlikten sonrakilerin numarası kaysın.
+        self.sayfalari_duzenle()
+        self.tabloyu_yenile()
+
+        self.ozet_guncelle(self.sonuclar)
+        self.gecmisi_guncellemeyi_planla()
+        if self.table.rowCount():
+            self.table.selectRow(min(r, self.table.rowCount() - 1))
+        else:
+            self.preview.clear()
+            self._sayfa_bilgi_metni = ""
+            self._onizleme_ipucu_metni = ""
+            self.onizleme_yazilarini_tazele()
 
     def sayfa_satirlarini_sirala(self, satirlar):
         """Bir sayfanın satırlarını kimliğin sayfadaki YERİNE göre dizer:
