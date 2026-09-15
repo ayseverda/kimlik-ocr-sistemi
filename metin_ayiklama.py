@@ -445,7 +445,7 @@ def tc_bilgilerini_oku(kart, sayfa_no=None, debug=False, derin=True):
         tum_adaylar += tc_adaylarini_topla(serit_ocr)
         aday, aday_item = tc_bul(serit_ocr)
         if aday != "Bulunamadi":
-            tc_no, tc_item, tc_dogrulandi, tc_kaynak = aday, tc_item, True, "serit"
+            tc_no, tc_item, tc_dogrulandi, tc_kaynak = aday, aday_item, True, "serit"
 
     if not tc_dogrulandi and derin:
         # 2) Kontrast arttirilmis tam bolge
@@ -479,7 +479,10 @@ def tc_bilgilerini_oku(kart, sayfa_no=None, debug=False, derin=True):
         # 4) Hicbiri tutmadi: en guvenli 11 haneli okumayi yine de bildir.
         #    "Bulunamadi" yazip kimligi kaybetmektense, kullaniciya
         #    dogrulanmamis numarayi gosterip kontrol ettirmek daha iyi.
-        tc_no, conf, tc_item = tum_adaylar[0]
+        # Güven, birazdan tc_item.get("conf") üzerinden okunuyor — burada
+        # ayrıca tutmaya gerek yok (önceden gereksiz bir "conf" değişkeni
+        # burada tutulup hiç kullanılmıyordu, kafa karıştırıcıydı).
+        tc_no, _, tc_item = tum_adaylar[0]
         tc_kaynak = "dogrulanmadi"
 
     soyad_label = fuzzy_label_bul(ocr, SOYAD_LABEL_HEDEFLERI)

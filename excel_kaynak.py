@@ -14,6 +14,7 @@ oradan tamamlanabiliyor.
 """
 
 import os
+from collections import OrderedDict
 
 import cv2
 import numpy as np
@@ -38,7 +39,12 @@ BANT_ARA_BOSLUK = 16
 # Kişinin adının arandığı sütun (F)
 AD_SUTUNU = 6
 
-_KITAP_ONBELLEK = {}
+# En yeni kaç dosya belleklerde açık tutulsun. Kullanıcı birden fazla Excel
+# dosyası seçip aralarında gezinebildiği için (dosya_sec/klasor_sec çoklu
+# seçime izin veriyor) tek girdilik bir önbellek her dosya değişiminde
+# yeniden yükleme yapıyordu — büyük, çok görselli dosyalarda pahalı.
+_KITAP_ONBELLEK_AZAMI = 3
+_KITAP_ONBELLEK = OrderedDict()
 
 
 def excel_mi(yol):
@@ -46,15 +52,24 @@ def excel_mi(yol):
 
 
 def _kitabi_ac(yol):
-    """Aynı dosya tekrar tekrar açılmasın (görüntüler tembel okunuyor)."""
+    """Aynı dosya tekrar tekrar açılmasın (görüntüler tembel okunuyor).
+
+    En yeni kullanılan _KITAP_ONBELLEK_AZAMI dosya birlikte tutulur (LRU):
+    tek girdilik önbellek, iki dosya arasında ileri geri gezinirken (ör.
+    tarama sırasında farklı Excel dosyalarından sırayla bant okurken) her
+    seferinde yeniden yüklemeye yol açıyordu."""
     anahtar = (os.path.abspath(yol), os.path.getmtime(yol))
     kitap = _KITAP_ONBELLEK.get(anahtar)
-    if kitap is None:
-        if openpyxl is None:
-            raise RuntimeError("openpyxl kurulu değil; Excel dosyaları okunamıyor.")
-        kitap = openpyxl.load_workbook(yol)
-        _KITAP_ONBELLEK.clear()
-        _KITAP_ONBELLEK[anahtar] = kitap
+    if kitap is not None:
+        _KITAP_ONBELLEK.move_to_end(anahtar)   # az önce kullanıldı, en tazeye taşı
+        return kitap
+
+    if openpyxl is None:
+        raise RuntimeError("openpyxl kurulu değil; Excel dosyaları okunamıyor.")
+    kitap = openpyxl.load_workbook(yol)
+    _KITAP_ONBELLEK[anahtar] = kitap
+    if len(_KITAP_ONBELLEK) > _KITAP_ONBELLEK_AZAMI:
+        _KITAP_ONBELLEK.popitem(last=False)    # en eski kullanılanı at
     return kitap
 
 

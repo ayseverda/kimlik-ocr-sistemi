@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from goruntu_isleme import sayfa_sirasina_diz
+from metin_ayiklama import tc_kimlik_gecerli_mi
 import gecmis
 import excel_kaynak
 import karsilastirma
@@ -574,7 +575,12 @@ class MainWindow(QMainWindow):
         # Durum yazısı OCR sonucunu anlatıyordu; elle doldurulan alandan sonra
         # "Eksik alan: Ad" gibi yanıltıcı kalıyordu. Yeniden hesaplanıyor.
         satir = self.sonuclar[row]
-        satir["_tc_supheli"] = False
+        # Yalnızca Kimlik No'nun kendisi düzenlendiğinde şüphe durumu
+        # yeniden değerlendirilir — Ad/Soyad'ı düzeltmek, dokunulmamış bir
+        # Kimlik No'nun checksum uyarısını sessizce silmemeli (kullanıcı o
+        # numarayı hiç görmemiş/onaylamamış olabilir).
+        if baslik == "Kimlik No":
+            satir["_tc_supheli"] = yeni_deger != "Bulunamadi" and not tc_kimlik_gecerli_mi(yeni_deger)
         eksikler = [
             alan for alan in ("Kimlik No", "Ad", "Soyad")
             if str(satir.get(alan, "")).strip() in ("", "Bulunamadi")

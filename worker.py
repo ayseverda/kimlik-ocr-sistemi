@@ -226,7 +226,6 @@ class Worker(QThread):
             )
 
         satir = max(satirlar, key=dolu_alan)
-        satir["Kart"] = "1/1" if satir.get("_kart_bulundu") else "-"
 
         excel_adi = (ek_bilgi or {}).get("excel_adi") or ""
         excelden = []
@@ -249,6 +248,10 @@ class Worker(QThread):
         satir["_ad_uyusmazligi"] = bool(ad_uyusmazligi)
         if excelden:
             satir["_kart_bulundu"] = True
+        # "Kart" _kart_bulundu'nun NİHAİ halinden sonra hesaplanıyor — kart
+        # hizalanamasa bile Excel'deki isimden tamamlanan bir satır artık
+        # "bulundu" sayılıyor, "Kart" sütunu bunu yansıtmalı, "-" kalmamalı.
+        satir["Kart"] = "1/1" if satir.get("_kart_bulundu") else "-"
 
         # Durum, tamamlanan alanlardan sonra yeniden yazılıyor.
         eksikler = [

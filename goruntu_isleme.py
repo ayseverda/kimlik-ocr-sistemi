@@ -287,13 +287,6 @@ def adaylari_sirala(kp_resim, des_resim, detector_tipi):
     return basarili_adaylar, {a["belge_tipi"]: a.get("hata") for a in adaylar if a.get("hata")}
 
 
-def belge_tipini_bul(resim, mod="normal"):
-    calisma, olcek = calisma_goruntusu(resim)
-    kp_resim, des_resim, detector_tipi = resim_descriptor_cikar(calisma, mod)
-    basarili_adaylar, hatalar = adaylari_sirala(kp_resim, des_resim, detector_tipi)
-    return basarili_adaylar, olcek, hatalar
-
-
 # =========================================================
 # GEOMETRİ + PERSPEKTİF (tek, genel — belge tipine özel dallanma yok,
 # sadece BELGE_KONFIG'teki sayılar farklı)
