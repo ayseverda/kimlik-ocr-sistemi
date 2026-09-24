@@ -25,7 +25,7 @@ from openpyxl import load_workbook
 from openpyxl.comments import Comment
 from openpyxl.styles import PatternFill, Font
 
-from PySide6.QtCore import Qt, QEvent, QTimer
+from PySide6.QtCore import Qt, QEvent, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -57,6 +57,15 @@ print(f"[CV2 FILE] {getattr(cv2, '__file__', '?')}")
 print(f"[CV2 VERSION] {getattr(cv2, '__version__', '?')}")
 
 
+class TiklanabilirEtiket(QLabel):
+    """QLabel + tıklama sinyali (bulunamayanlar özetine tıklayınca filtrelemek için)."""
+    tiklandi = Signal()
+
+    def mousePressEvent(self, olay):
+        self.tiklandi.emit()
+        super().mousePressEvent(olay)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -69,6 +78,10 @@ class MainWindow(QMainWindow):
         self.canli_sonuclar = []
         self.pdf_bytes = None
         self.worker = None
+        # Aynı PDF içinde tekrar eden Kimlik No'ların (Dosya, Kimlik No) anahtarları.
+        self._tekrar_eden_kimlikler = set()
+        # Özet çubuğuna tıklanınca yalnız eksik/şüpheli kayıtlar gösterilir.
+        self._sadece_eksikler_goster = False
 
         # Önizleme: zoom = None ise pencereye sığdırılır, sayı ise o oranda gösterilir.
         self.zoom = None
@@ -195,9 +208,12 @@ class MainWindow(QMainWindow):
         # Okunamayan alanların sayısı buraya yazılır
         # ("3 Kimlik No bulunamadı, 1 Ad bulunamadı..."), satırlar
         # geldikçe canlı güncellenir.
-        self.ozet = QLabel("")
+        self.ozet = TiklanabilirEtiket("")
         self.ozet.setWordWrap(True)
         self.ozet.setStyleSheet("color: #cbd5e1; font-size: 13px;")
+        self.ozet.setCursor(Qt.PointingHandCursor)
+        self.ozet.setToolTip("Yalnızca eksik/şüpheli kayıtları görmek için tıklayın.")
+        self.ozet.tiklandi.connect(self.bulunamayanlari_filtrele)
         ana.addWidget(self.ozet)
 
         self.progress = QProgressBar()
@@ -401,6 +417,7 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.sonuclar = []
         self.canli_sonuclar = []
+        self._sadece_eksikler_goster = False
         self.ozet.setText("")
         self.gecmis_yolu = None
         self.pdf_bytes = None
@@ -470,13 +487,93 @@ class MainWindow(QMainWindow):
 
         return sayac, kart_bulunamayan, supheli
 
+    def _satir_eksik_mi(self, r):
+        """"Bulunamayanlar" özetine giren bir satır mı? (eksik alan / kart yok / TC şüpheli)"""
+        if not r.get("_kart_bulundu", True):
+            return True
+        if r.get("_tc_supheli"):
+            return True
+        for alan in ("Kimlik No", "Ad", "Soyad"):
+            if str(r.get(alan, "")).strip() in ("", "-", "Bulunamadi"):
+                return True
+        if r.get("_belge_tipi") == "gocmen" and str(r.get("Bitiş Tarihi", "")).strip() in ("", "-"):
+            return True
+        return False
+
+    def _tekrar_eden_anahtarlari(self, satirlar):
+        """Aynı PDF'te (Dosya) birden fazla kez geçen Kimlik No'ların
+        (Dosya, Kimlik No) anahtarlarını döner."""
+        sayac = {}
+        for r in satirlar:
+            no = str(r.get("Kimlik No", "")).strip()
+            if no in ("", "-", "Bulunamadi"):
+                continue
+            anahtar = (r.get("Dosya"), no)
+            sayac[anahtar] = sayac.get(anahtar, 0) + 1
+        return {anahtar for anahtar, adet in sayac.items() if adet > 1}
+
+    def _satir_tekrar_ediyor_mu(self, r):
+        no = str(r.get("Kimlik No", "")).strip()
+        if no in ("", "-", "Bulunamadi"):
+            return False
+        return (r.get("Dosya"), no) in self._tekrar_eden_kimlikler
+
+    def _tabloyu_yeniden_renklendir(self, satirlar):
+        """Tekrar eden kimlikleri yeniden hesaplayıp tablodaki mevcut hücreleri
+        (yeniden oluşturmadan) baştan boyar — satirlar, tablodaki satırlarla
+        aynı sırada olmalı."""
+        self._tekrar_eden_kimlikler = self._tekrar_eden_anahtarlari(satirlar)
+        self._table_updating = True
+        try:
+            for r, satir in enumerate(satirlar):
+                if r >= self.table.rowCount():
+                    break
+                tekrar_eden = self._satir_tekrar_ediyor_mu(satir)
+                for c, h in enumerate(self.headers):
+                    item = self.table.item(r, c)
+                    if item is not None:
+                        self._hucre_rengini_belirle(item, satir, h, tekrar_eden)
+        finally:
+            self._table_updating = False
+
+    def _filtreyi_uygula(self, satirlar):
+        for r, satir in enumerate(satirlar):
+            if r >= self.table.rowCount():
+                break
+            self.table.setRowHidden(r, not self._satir_eksik_mi(satir))
+
+    def bulunamayanlari_filtrele(self):
+        """Özet çubuğuna tıklanınca yalnız eksik/şüpheli kayıtları gösterir;
+        tekrar tıklanınca tüm listeye döner."""
+        satirlar = self.sonuclar if self.sonuclar else self.canli_sonuclar
+        if not satirlar:
+            return
+
+        if self._sadece_eksikler_goster:
+            self._sadece_eksikler_goster = False
+            for r in range(self.table.rowCount()):
+                self.table.setRowHidden(r, False)
+            self.ozet_guncelle(satirlar)
+            return
+
+        if not any(self._satir_eksik_mi(s) for s in satirlar):
+            return  # bulunamayan yok, filtrelenecek bir şey yok
+
+        self._sadece_eksikler_goster = True
+        self.ozet_guncelle(satirlar)
+
     def ozet_guncelle(self, satirlar):
-        """Bulunamayan alanların özetini bilgi çubuğunun altına yazar."""
+        """Bulunamayan alanların özetini bilgi çubuğunun altına yazar; aynı
+        PDF'te tekrar eden kimlikleri pembe boyar; eksik-filtresi açıksa
+        onu da tazeler."""
         if not satirlar:
             self.ozet.setText("")
+            self._tekrar_eden_kimlikler = set()
             return
 
         sayac, kart_bulunamayan, supheli = self.eksik_sayilari(satirlar)
+        self._tabloyu_yeniden_renklendir(satirlar)
+        tekrar_satir_sayisi = sum(1 for r in satirlar if self._satir_tekrar_ediyor_mu(r))
 
         parcalar = []
         if kart_bulunamayan:
@@ -486,6 +583,8 @@ class MainWindow(QMainWindow):
         )
         if supheli:
             parcalar.append(f"{supheli} Kimlik No doğrulanamadı")
+        if tekrar_satir_sayisi:
+            parcalar.append(f"{tekrar_satir_sayisi} kayıt aynı PDF'te tekrarlanıyor")
 
         if parcalar:
             self.ozet.setText("Bulunamayanlar →  " + "   ·   ".join(parcalar))
@@ -496,6 +595,11 @@ class MainWindow(QMainWindow):
                 f"Bulunamayan alan yok — {okunan} kimliğin tüm alanları okundu."
             )
             self.ozet.setStyleSheet("color: #86efac; font-size: 13px; font-weight: 600;")
+
+        if self._sadece_eksikler_goster:
+            self._filtreyi_uygula(satirlar)
+            self.ozet.setText("🔎 Sadece eksik/şüpheli kayıtlar gösteriliyor — geri dönmek için tekrar tıklayın")
+            self.ozet.setStyleSheet("color: #f0b429; font-size: 13px; font-weight: 700;")
 
     def debug_gorunumu_degisti(self, aktif):
         """
@@ -593,11 +697,12 @@ class MainWindow(QMainWindow):
             durum_item = self.table.item(row, self.headers.index("Durum"))
             if durum_item is not None:
                 durum_item.setText(satir["Durum"])
-                durum_item.setForeground(QColor("#93c5fd"))
         finally:
             self._table_updating = False
 
-        self.duzenlenmis_hucreyi_boya(item)
+        # Renklendirme (tekrar eden kimlik, elle düzenleme vurgusu, Durum
+        # rengi...) ozet_guncelle içindeki _tabloyu_yeniden_renklendir ile
+        # tek yerden ve tutarlı şekilde uygulanıyor.
         self.ozet_guncelle(self.sonuclar)
         self.gecmisi_guncellemeyi_planla()
 
@@ -1316,6 +1421,7 @@ class MainWindow(QMainWindow):
     def tabloyu_yenile(self, secilecek=None):
         """Tabloyu self.sonuclar'dan baştan kurar (sıra değiştiğinde).
         `secilecek` verilen satır sözlüğü tekrar seçili hale gelir."""
+        self._sadece_eksikler_goster = False
         self._table_updating = True
         try:
             self.table.setRowCount(0)
@@ -1340,12 +1446,48 @@ class MainWindow(QMainWindow):
         item.setBackground(QColor("#1f3350"))
         item.setForeground(QColor("#93c5fd"))
 
+    def _hucre_rengini_belirle(self, item, row, h, tekrar_eden):
+        """Bir hücrenin tüm renk kurallarını sıfırdan (yeniden) uygular.
+
+        Hem yeni satır eklenirken hem de tekrar-eden-kimlik durumu değişip
+        tabloyu yeniden boyarken (_tabloyu_yeniden_renklendir) kullanılıyor —
+        tek yerden yönetilince kurallar tutarlı kalıyor."""
+        item.setData(Qt.ForegroundRole, None)
+        item.setData(Qt.BackgroundRole, None)
+
+        if tekrar_eden:
+            item.setBackground(QColor("#4a1942"))
+            item.setForeground(QColor("#f9a8d4"))
+
+        if row.get("_belge_gecerli") is False and h == "Geçerlilik":
+            item.setForeground(QColor("#ff6b6b"))
+        if row.get("_kurtarildi") and h in ("Kart", "Durum"):
+            item.setForeground(QColor("#f0b429"))
+        if row.get("_tc_supheli") and h in ("Kimlik No", "Durum"):
+            item.setForeground(QColor("#f0b429"))
+        if row.get("_manuel_eklendi"):
+            item.setForeground(QColor("#ffb454"))
+        # Excel'den tamamlanan ad/soyad ve ad uyuşmazlığı
+        if h in (row.get("_excelden_alanlar") or ()):
+            item.setForeground(QColor("#a5b4fc"))
+        if row.get("_ad_uyusmazligi") and h in ("Ad", "Soyad", "Durum"):
+            item.setForeground(QColor("#f0b429"))
+        # Elle düzenleme sonrası Durum yazısı da vurgulanır (hangi alan
+        # değiştirilmiş olursa olsun) — en son uygulanır ki önceki turuncu
+        # vurgulardan sonra hep mavi görünsün, eskiden hucre_degisti'nin
+        # elle yaptığı gibi.
+        if row.get("_duzenlenen_alanlar") and h == "Durum":
+            item.setForeground(QColor("#93c5fd"))
+        if h in (row.get("_duzenlenen_alanlar") or ()):
+            self.duzenlenmis_hucreyi_boya(item)
+
     def tabloya_satir_yaz(self, row, hedef=None):
         """Tek bir satırı tabloya ekler (renklendirme kurallarıyla birlikte)."""
         r = self.table.rowCount() if hedef is None else hedef
         self.table.insertRow(r)
 
         editable_headers = {"Kimlik No", "Ad", "Soyad"}
+        tekrar_eden = self._satir_tekrar_ediyor_mu(row)
         for c, h in enumerate(self.headers):
             item = QTableWidgetItem(str(row.get(h, "")))
 
@@ -1354,21 +1496,7 @@ class MainWindow(QMainWindow):
             else:
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
 
-            if row.get("_belge_gecerli") is False and h == "Geçerlilik":
-                item.setForeground(QColor("#ff6b6b"))
-            if row.get("_kurtarildi") and h in ("Kart", "Durum"):
-                item.setForeground(QColor("#f0b429"))
-            if row.get("_tc_supheli") and h in ("Kimlik No", "Durum"):
-                item.setForeground(QColor("#f0b429"))
-            if row.get("_manuel_eklendi"):
-                item.setForeground(QColor("#ffb454"))
-            # Excel'den tamamlanan ad/soyad ve ad uyuşmazlığı
-            if h in (row.get("_excelden_alanlar") or ()):
-                item.setForeground(QColor("#a5b4fc"))
-            if row.get("_ad_uyusmazligi") and h in ("Ad", "Soyad", "Durum"):
-                item.setForeground(QColor("#f0b429"))
-            if h in (row.get("_duzenlenen_alanlar") or ()):
-                self.duzenlenmis_hucreyi_boya(item)
+            self._hucre_rengini_belirle(item, row, h, tekrar_eden)
 
             self.table.setItem(r, c, item)
         return r
