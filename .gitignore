@@ -5,22 +5,28 @@ __pycache__/
 venv/
 env/
 exe_ortami/
+.env
 
-# Streamlit
-.streamlit/secrets.toml
-
-# PyInstaller build kalıntıları
+# PyInstaller build çıktıları (KimlikOkuyucu.spec repoda tutulur)
 build/
 dist/
-*.spec
 
-# EasyOCR modelleri
+# EasyOCR modelleri (ilk çalıştırmada indirilir / pakete gömülür)
 easyocr_models/
 .EasyOCR/
+
+# Editör / araç ayarları
+.vscode/
+.idea/
+.claude/
+*.log
 
 # İşletim sistemi
 .DS_Store
 Thumbs.db
+
+# Yerel demo verisi (video için üretilen kurgusal dosyalar)
+demo_veri/
 
 # Gerçek kimlik görselleri / test verisi burada tutulmasın
 *.jpg
